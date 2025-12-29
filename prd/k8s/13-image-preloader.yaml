@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: image-preloader
+  namespace: packamal
+  labels:
+    app: image-preloader
+spec:
+  selector:
+    matchLabels:
+      app: image-preloader
+  template:
+    metadata:
+      labels:
+        app: image-preloader
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: image-preloader
+        # Use the analysis image which has podman available
+        image: packamal-go-worker-analysis:local
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          echo "Starting image pre-loader..."
+          
+          # Wait a bit for podman to be ready
+          sleep 5
+          
+          # Try to pull using podman (which is what the analysis container uses)
+          if command -v podman &> /dev/null; then
+            echo "Using podman to pre-load dynamic-analysis image..."
+            # Configure podman to use the host's container storage if possible
+            # This allows the image to be available to other containers on the same node
+            podman pull docker.io/pakaremon/dynamic-analysis:latest || {
+              echo "Warning: podman pull failed, trying alternative method..."
+            }
+            echo "Image pre-loaded successfully with podman"
+          else
+            echo "podman not found, trying crictl..."
+          fi
+          
+          # Also try crictl (for containerd) to pre-load into node's image cache
+          if command -v crictl &> /dev/null; then
+            echo "Using crictl to pre-load dynamic-analysis image into containerd..."
+            # Configure crictl to use containerd socket
+            export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+            crictl pull docker.io/pakaremon/dynamic-analysis:latest || {
+              echo "Warning: crictl pull failed"
+            }
+            echo "Image pre-loaded successfully with crictl"
+          else
+            echo "crictl not found"
+          fi
+          
+          # Keep container running to maintain the pre-loaded image
+          # The image will be cached on the node's storage
+          echo "Image pre-loading complete. Container will keep running to maintain cache."
+          echo "Pre-loaded image: docker.io/pakaremon/dynamic-analysis:latest"
+          sleep infinity
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        volumeMounts:
+        # Mount containerd socket to allow crictl access
+        - name: containerd-sock
+          mountPath: /run/containerd
+        # Mount container storage locations
+        - name: container-storage
+          mountPath: /var/lib/containers
+        # Mount CNI paths (may be needed for podman)
+        - name: cni-bin
+          mountPath: /opt/cni/bin
+        - name: cni-cache
+          mountPath: /var/lib/cni
+      volumes:
+      - name: containerd-sock
+        hostPath:
+          path: /run/containerd
+          type: DirectoryOrCreate
+      - name: container-storage
+        hostPath:
+          path: /var/lib/containers
+          type: DirectoryOrCreate
+      - name: cni-bin
+        hostPath:
+          path: /opt/cni/bin
+      - name: cni-cache
+        hostPath:
+          path: /var/lib/cni
+      tolerations:
+      # Allow running on all nodes including master/control plane
+      - operator: Exists
+

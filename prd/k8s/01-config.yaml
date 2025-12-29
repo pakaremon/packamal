@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: packamal-config
+  namespace: packamal
+data:
+  # Django
+  DEBUG: "False"
+  # For Minikube it's convenient to allow all; tighten for real prod.
+  ALLOWED_HOSTS: "*"
+  # CSRF trusted origins - add your public IP and any other access points
+  # Format: comma-separated list of origins (protocol://host:port)
+  CSRF_TRUSTED_ORIGINS: "http://20.187.145.56:8080,http://20.187.145.56:80,http://20.187.145.56:443,http://20.187.145.56:30000,http://20.187.145.56:30080"
+
+  # Postgres (matches backend `packamal/settings.py` env var names)
+  POSTGRES_DB: "packamal"
+  POSTGRES_USER: "packamal_db"
+  POSTGRES_HOST: "database"
+  POSTGRES_PORT: "5432"
+
+  # Redis / Celery
+  CELERY_BROKER_URL: "redis://redis:6379/0"
+  CELERY_RESULT_BACKEND: "redis://redis:6379/0"
+  REDIS_URL: "redis://redis:6379/0"
+
+  # Application Configuration
+  API_URL: "http://backend:8000/api/v1/internal/callback/done/"
+  RESULTS_VOLUME: "analysis_results"
+  CONTAINER_DIR_OVERRIDE: "/tmp/container-lib"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: packamal-secrets
+  namespace: packamal
+type: Opaque
+stringData:
+  # CHANGE THESE for any real deployment
+  POSTGRES_PASSWORD: "rock-beryl-say-devices"
+  SECRET_KEY: "#d%!dmd7v+nfg9=(%y@v(c_lfpja02*#0&5ohk=42bljrl99y!"
+  INTERNAL_API_TOKEN: "Rthj7yHEBt9Fp3A9BHfmfsDcuIPItWOnSkRNy4euus5825cAd8ho4J4CRLfOmCM2"
+  AUTH_TOKEN: "packamal-auth-token"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-script
+  namespace: packamal
+data:
+  init.sql: |
+    -- Note: Database and user are created automatically by PostgreSQL container
+    -- from POSTGRES_DB and POSTGRES_USER environment variables
+    -- This script runs after the database is created and is already connected to it
+
+    -- Create user if it doesn't exist (idempotent)
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'packamal_db') THEN
+        CREATE USER packamal_db WITH PASSWORD 'rock-beryl-say-devices';
+      END IF;
+    END
+    $$;
+
+    -- Configure user settings
+    ALTER ROLE packamal_db SET client_encoding TO 'utf8';
+    ALTER ROLE packamal_db SET default_transaction_isolation TO 'read committed';
+    ALTER ROLE packamal_db SET timezone TO 'UTC';
+
+    -- Grant ONLY necessary privileges (not superuser)
+    GRANT CONNECT ON DATABASE packamal TO packamal_db;
+    GRANT USAGE ON SCHEMA public TO packamal_db;
+
+    -- Grant privileges on existing tables
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO packamal_db;
+
+    -- Grant privileges on sequences (for auto-increment fields)
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO packamal_db;
+
+    -- Set default privileges for future tables
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO packamal_db;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO packamal_db;
+
+    -- Full privileges ==> Caution
+    GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO packamal_db;
+    GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO packamal_db;
+
+    -- Revoke public schema access from public role
+    REVOKE ALL ON SCHEMA public FROM public;
+
+

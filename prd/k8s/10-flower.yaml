@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flower
+  namespace: packamal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flower
+  template:
+    metadata:
+      labels:
+        app: flower
+    spec:
+      containers:
+        - name: flower
+          # Reuses the backend image; runs Flower for Celery monitoring.
+          image: packamal-backend:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5555
+              name: flower
+          envFrom:
+            - configMapRef:
+                name: packamal-config
+            - secretRef:
+                name: packamal-secrets
+          # Start Flower directly with explicit broker URL
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until nc -z redis 6379; do
+                echo "Waiting for Redis..."
+                sleep 2
+              done
+              until nc -z database 5432; do
+                echo "Waiting for database..."
+                sleep 2
+              done
+              echo "Redis and database are ready! Starting Flower..."
+              # Unset FLOWER_PORT to avoid conflict with Kubernetes service discovery env var
+              unset FLOWER_PORT
+              exec celery -A packamal flower --port=5555
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 5555
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 5555
+            initialDelaySeconds: 10
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flower
+  namespace: packamal
+spec:
+  selector:
+    app: flower
+  ports:
+    - name: flower
+      port: 5555
+      targetPort: 5555
+      nodePort: 30555
+  type: NodePort
+
