@@ -2,5 +2,8 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: packamal
-
+  labels:
+    # Required for Kubernetes 1.25+ Pod Security Admission to allow privileged pods
+    # in this namespace (e.g. analysis jobs and image-preloader DaemonSet).
+    pod-security.kubernetes.io/enforce: privileged
 

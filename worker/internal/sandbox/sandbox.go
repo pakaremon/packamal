@@ -19,7 +19,9 @@ import (
 
 const (
 	podmanBin     = "podman"
-	runtimeBin    = "/usr/local/bin/runsc_compat.sh"
+	// defaultRuntimeBin is the default OCI runtime used by podman.
+	// It points to a gVisor wrapper for sandboxing.
+	defaultRuntimeBin = "/usr/local/bin/runsc_compat.sh"
 	rootDir       = "/var/run/runsc"
 	runLogFile    = "runsc.log.boot"
 	logDirPattern = "sandbox_logs_"
@@ -30,6 +32,36 @@ const (
 	// from the host.
 	networkName = "analysis-net"
 )
+
+func runtimeBin() string {
+	// Allow overriding the OCI runtime used by podman. This is critical in
+	// Kubernetes environments where gVisor/runsc + cgroup management can fail.
+	//
+	// Examples:
+	// - PODMAN_RUNTIME=/usr/local/bin/runsc_compat.sh  (default, gVisor)
+	// - PODMAN_RUNTIME=/usr/bin/crun                   (fallback)
+	if v := os.Getenv("PODMAN_RUNTIME"); v != "" {
+		return v
+	}
+	return defaultRuntimeBin
+}
+
+func podmanCgroupsMode() string {
+	// Podman supports --cgroups=enabled|disabled|no-conmon|split on create/run.
+	// In some Kubernetes setups, writing to cgroup.procs from inside the pod
+	// returns EIO, which breaks nested podman containers. Allow override here.
+	if v := os.Getenv("PODMAN_CGROUPS"); v != "" {
+		return v
+	}
+	return "enabled"
+}
+
+func isGvisorRuntime(runtime string) bool {
+	// runsc_compat.sh wraps gVisor's runsc. The --runtime-flag options used by this
+	// project are runsc-specific and must not be passed to other OCI runtimes
+	// (e.g. crun).
+	return strings.Contains(runtime, "runsc")
+}
 
 type RunStatus uint8
 
@@ -267,10 +299,27 @@ func removeAllLogs() error {
 }
 
 func podman(ctx context.Context, args ...string) *exec.Cmd {
-	args = append([]string{
-		"--cgroup-manager=cgroupfs",
+	// Configure podman based on environment
+	// In Kubernetes/containers, we need to explicitly set cgroup manager
+	// since systemd is not available and auto-detection would fail
+	podmanArgs := []string{
 		"--events-backend=file",
-	}, args...)
+	}
+	
+	// Allow cgroup manager to be configured via environment variable
+	// If PODMAN_CGROUP_MANAGER is set, use it; otherwise default to cgroupfs
+	// In Kubernetes, systemd is not available, so we must use cgroupfs
+	cgroupManager := os.Getenv("PODMAN_CGROUP_MANAGER")
+	if cgroupManager == "" {
+		// Default to cgroupfs for containerized environments where systemd isn't available
+		cgroupManager = "cgroupfs"
+		slog.DebugContext(ctx, "podman cgroup manager not set, defaulting to cgroupfs")
+	} else {
+		slog.DebugContext(ctx, "podman using cgroup manager from environment", "manager", cgroupManager)
+	}
+	podmanArgs = append(podmanArgs, "--cgroup-manager="+cgroupManager)
+	
+	args = append(podmanArgs, args...)
 	slog.DebugContext(ctx, "podman", "args", args)
 	return exec.CommandContext(ctx, podmanBin, args...)
 }
@@ -295,8 +344,11 @@ func (s *podmanSandbox) pullImage(ctx context.Context) error {
 func (s *podmanSandbox) createContainer(ctx context.Context) (string, error) {
 	args := []string{
 		"create",
-		"--runtime=" + runtimeBin,
+		"--runtime=" + runtimeBin(),
 		"--init",
+	}
+	if mode := podmanCgroupsMode(); mode != "" {
+		args = append(args, "--cgroups="+mode)
 	}
 
 	networkArgs := []string{
@@ -328,21 +380,34 @@ func (s *podmanSandbox) createContainer(ctx context.Context) (string, error) {
 }
 
 func (s *podmanSandbox) startContainerCmd(ctx context.Context, logDir string) *exec.Cmd {
+	runtime := runtimeBin()
 	args := []string{
 		"start",
-		"--runtime=" + runtimeBin,
-		"--runtime-flag=overlay2=none",
-		"--runtime-flag=root=" + rootDir,
-		"--runtime-flag=debug-log=" + filepath.Join(logDir, "runsc.log.%COMMAND%"),
+		"--runtime=" + runtime,
 	}
-	if s.rawSockets {
-		args = append(args, "--runtime-flag=net-raw")
-	}
-	if s.strace {
-		args = append(args, "--runtime-flag=strace")
-	}
-	if s.logPackets {
-		args = append(args, "--runtime-flag=log-packets")
+
+	// Only gVisor/runsc supports these runtime flags. If PODMAN_RUNTIME is set to
+	// another OCI runtime (e.g. /usr/bin/crun), passing these flags will fail with
+	// "/usr/bin/crun: unrecognized option".
+	if isGvisorRuntime(runtime) {
+		args = append(args,
+			"--runtime-flag=overlay2=none",
+			"--runtime-flag=root="+rootDir,
+			"--runtime-flag=debug-log="+filepath.Join(logDir, "runsc.log.%COMMAND%"),
+		)
+		if s.rawSockets {
+			args = append(args, "--runtime-flag=net-raw")
+		}
+		if s.strace {
+			args = append(args, "--runtime-flag=strace")
+		}
+		if s.logPackets {
+			args = append(args, "--runtime-flag=log-packets")
+		}
+	} else {
+		if s.rawSockets || s.strace || s.logPackets {
+			slog.DebugContext(ctx, "non-runsc runtime: ignoring runtime flags", "runtime", runtime)
+		}
 	}
 	args = append(args, s.container)
 

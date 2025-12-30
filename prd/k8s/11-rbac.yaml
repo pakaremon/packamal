@@ -16,8 +16,14 @@ rules:
     verbs: ["create", "get", "list", "watch", "delete"]
   # Allow getting and listing Pods (for job status monitoring)
   - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch"]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "delete"]
+  # Optional: support clusters with custom admission (e.g. OpenShift SCC / OPA)
+  # so that this service account can be granted or updated to use privileged
+  # security constraints if the cluster enforces them.
+  - apiGroups: ["security.openshift.io"]
+    resources: ["securitycontextconstraints"]
+    verbs: ["get", "list", "watch", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

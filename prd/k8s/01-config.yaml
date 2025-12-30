@@ -27,6 +27,8 @@ data:
   API_URL: "http://backend:8000/api/v1/internal/callback/done/"
   RESULTS_VOLUME: "analysis_results"
   CONTAINER_DIR_OVERRIDE: "/tmp/container-lib"
+  ANALYSIS_IMAGE: "packamal-go-worker-analysis:local"
+  SANDBOX_DYNAMIC_ANALYSIS_IMAGE: "docker.io/pakaremon/dynamic-analysis"
 
 ---
 apiVersion: v1

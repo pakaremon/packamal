@@ -111,10 +111,10 @@ echo -e "${GREEN}✅ Minikube is running${NC}"
 echo ""
 
 # Step 2: Set up minikube docker environment
-echo -e "${BLUE}Step 2: Setting up minikube docker environment...${NC}"
-eval "$(minikube docker-env)"
-echo -e "${GREEN}✅ Docker environment configured${NC}"
-echo ""
+# echo -e "${BLUE}Step 2: Setting up minikube docker environment...${NC}"
+# eval "$(minikube docker-env)"
+# echo -e "${GREEN}✅ Docker environment configured${NC}"
+# echo ""
 
 # Step 3: Delete the previous namespace
 echo -e "${BLUE}Step 3: Deleting previous namespace...${NC}"
@@ -144,10 +144,32 @@ echo -e "${YELLOW}  Building backend image...${NC}"
 docker build -t packamal-backend:local "$BACKEND_DIR"
 echo -e "${GREEN}✅ Backend image built${NC}"
 
+
 echo -e "${YELLOW}  Building frontend image...${NC}"
 docker build -t packamal-frontend:local "$FRONTEND_DIR"
 echo -e "${GREEN}✅ Frontend image built${NC}"
+
+echo -e "${YELLOW}  Loading backend image...${NC}"
+minikube image load packamal-backend:local
+echo -e "${GREEN}✅ Backend image loaded${NC}"
 echo ""
+
+echo -e "${YELLOW}  Loading frontend image...${NC}"
+minikube image load packamal-frontend:local
+echo -e "${GREEN}✅ Frontend image loaded${NC}"
+echo ""
+
+if [ "$1" = "-w" ] ; then
+    echo -e "${YELLOW}  Building go worker analysis image...${NC}"
+    docker build -t packamal-go-worker-analysis:local -f /home/azureuser/packamal/worker/cmd/analyze/Dockerfile /home/azureuser/packamal/worker
+    echo -e "${GREEN}✅ Go worker analysis image built${NC}"
+    echo ""
+
+    echo -e "${YELLOW}  Loading go worker analysis image...${NC}"
+    minikube image load packamal-go-worker-analysis:local
+    echo -e "${GREEN}✅ Go worker analysis image loaded${NC}"
+    echo ""
+fi
 
 # Step 5: Apply Kubernetes resources
 echo -e "${BLUE}Step 5: Applying Kubernetes resources...${NC}"
@@ -172,82 +194,82 @@ fi
 echo ""
 
 # Step 7: Create superuser
-echo -e "${BLUE}Step 7: Creating superuser...${NC}"
+# echo -e "${BLUE}Step 7: Creating superuser...${NC}"
 
-# Wait a bit more for backend to be fully ready (database migrations, etc.)
-echo -e "${YELLOW}  Waiting for backend to be fully ready...${NC}"
-sleep 10
+# # Wait a bit more for backend to be fully ready (database migrations, etc.)
+# echo -e "${YELLOW}  Waiting for backend to be fully ready...${NC}"
+# sleep 10
 
-# Check if backend pod is ready
-BACKEND_POD=$(kubectl get pod -n "$NAMESPACE" -l app=backend -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-if [ -z "$BACKEND_POD" ]; then
-    echo -e "${RED}❌ Error: Backend pod not found${NC}"
-    exit 1
-fi
+# # Check if backend pod is ready
+# BACKEND_POD=$(kubectl get pod -n "$NAMESPACE" -l app=backend -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+# if [ -z "$BACKEND_POD" ]; then
+#     echo -e "${RED}❌ Error: Backend pod not found${NC}"
+#     exit 1
+# fi
 
-echo -e "${YELLOW}  Checking if superuser already exists...${NC}"
-if superuser_exists; then
-    echo -e "${YELLOW}  Superuser '$DJANGO_SUPERUSER_USERNAME' already exists, skipping creation...${NC}"
-else
-    echo -e "${YELLOW}  Creating superuser with username: $DJANGO_SUPERUSER_USERNAME${NC}"
-    echo -e "${YELLOW}  (This may take a moment as the container initializes...)${NC}"
+# echo -e "${YELLOW}  Checking if superuser already exists...${NC}"
+# if superuser_exists; then
+#     echo -e "${YELLOW}  Superuser '$DJANGO_SUPERUSER_USERNAME' already exists, skipping creation...${NC}"
+# else
+#     echo -e "${YELLOW}  Creating superuser with username: $DJANGO_SUPERUSER_USERNAME${NC}"
+#     echo -e "${YELLOW}  (This may take a moment as the container initializes...)${NC}"
     
-    # Encode credentials to base64 to safely handle special characters (remove newlines for single line)
-    USERNAME_B64=$(printf '%s' "$DJANGO_SUPERUSER_USERNAME" | base64 | tr -d '\n')
-    EMAIL_B64=$(printf '%s' "$DJANGO_SUPERUSER_EMAIL" | base64 | tr -d '\n')
-    PASSWORD_B64=$(printf '%s' "$DJANGO_SUPERUSER_PASSWORD" | base64 | tr -d '\n')
+#     # Encode credentials to base64 to safely handle special characters (remove newlines for single line)
+#     USERNAME_B64=$(printf '%s' "$DJANGO_SUPERUSER_USERNAME" | base64 | tr -d '\n')
+#     EMAIL_B64=$(printf '%s' "$DJANGO_SUPERUSER_EMAIL" | base64 | tr -d '\n')
+#     PASSWORD_B64=$(printf '%s' "$DJANGO_SUPERUSER_PASSWORD" | base64 | tr -d '\n')
     
-    # Create superuser using Django shell - decode base64 in Python to avoid shell escaping issues
-    PYTHON_CMD="import base64; from django.contrib.auth import get_user_model; User = get_user_model(); u = base64.b64decode('$USERNAME_B64').decode('utf-8'); e = base64.b64decode('$EMAIL_B64').decode('utf-8'); p = base64.b64decode('$PASSWORD_B64').decode('utf-8'); exists = User.objects.filter(username=u).exists(); User.objects.create_superuser(username=u, email=e, password=p) if not exists else None; print('CREATED' if not exists else 'EXISTS')"
+#     # Create superuser using Django shell - decode base64 in Python to avoid shell escaping issues
+#     PYTHON_CMD="import base64; from django.contrib.auth import get_user_model; User = get_user_model(); u = base64.b64decode('$USERNAME_B64').decode('utf-8'); e = base64.b64decode('$EMAIL_B64').decode('utf-8'); p = base64.b64decode('$PASSWORD_B64').decode('utf-8'); exists = User.objects.filter(username=u).exists(); User.objects.create_superuser(username=u, email=e, password=p) if not exists else None; print('CREATED' if not exists else 'EXISTS')"
     
-    CREATION_OUTPUT=$(kubectl exec -n "$NAMESPACE" deployment/backend --container=backend -- \
-        python manage.py shell -c "$PYTHON_CMD" 2>&1)
+#     CREATION_OUTPUT=$(kubectl exec -n "$NAMESPACE" deployment/backend --container=backend -- \
+#         python manage.py shell -c "$PYTHON_CMD" 2>&1)
     
-    CREATION_EXIT_CODE=$?
+#     CREATION_EXIT_CODE=$?
     
-    echo -e "${YELLOW}  Command output:${NC}"
-    echo "$CREATION_OUTPUT" | sed 's/^/    /'
+#     echo -e "${YELLOW}  Command output:${NC}"
+#     echo "$CREATION_OUTPUT" | sed 's/^/    /'
     
-    if [ $CREATION_EXIT_CODE -ne 0 ]; then
-        # Check if it failed because user already exists
-        if echo "$CREATION_OUTPUT" | grep -qi "already exists\|IntegrityError\|unique constraint"; then
-            echo -e "${YELLOW}  User already exists (creation was attempted but user exists)${NC}"
-        else
-            echo -e "${RED}❌ Error: Superuser creation command failed with exit code $CREATION_EXIT_CODE${NC}"
-            echo ""
-            echo -e "${YELLOW}Full error output:${NC}"
-            echo "$CREATION_OUTPUT"
-            exit 1
-        fi
-    fi
+#     if [ $CREATION_EXIT_CODE -ne 0 ]; then
+#         # Check if it failed because user already exists
+#         if echo "$CREATION_OUTPUT" | grep -qi "already exists\|IntegrityError\|unique constraint"; then
+#             echo -e "${YELLOW}  User already exists (creation was attempted but user exists)${NC}"
+#         else
+#             echo -e "${RED}❌ Error: Superuser creation command failed with exit code $CREATION_EXIT_CODE${NC}"
+#             echo ""
+#             echo -e "${YELLOW}Full error output:${NC}"
+#             echo "$CREATION_OUTPUT"
+#             exit 1
+#         fi
+#     fi
     
-    # Verify superuser was created
-    echo -e "${YELLOW}  Verifying superuser was created...${NC}"
-    sleep 2  # Give database a moment to commit
+#     # Verify superuser was created
+#     echo -e "${YELLOW}  Verifying superuser was created...${NC}"
+#     sleep 2  # Give database a moment to commit
     
-    if superuser_exists; then
-        echo -e "${GREEN}✅ Superuser created and verified successfully${NC}"
-    else
-        echo -e "${RED}❌ Error: Superuser creation failed - user does not exist after creation attempt${NC}"
-        echo ""
-        echo -e "${YELLOW}Debugging information:${NC}"
-        echo -e "${YELLOW}  Backend pod: $BACKEND_POD${NC}"
-        echo -e "${YELLOW}  Username: $DJANGO_SUPERUSER_USERNAME${NC}"
-        echo -e "${YELLOW}  Email: $DJANGO_SUPERUSER_EMAIL${NC}"
-        echo ""
-        echo -e "${YELLOW}Troubleshooting steps:${NC}"
-        echo "1. Check backend logs:"
-        echo "   kubectl logs -n $NAMESPACE deployment/backend --container=backend --tail=50"
-        echo ""
-        echo "2. Try to create superuser manually:"
-        echo "   kubectl exec -it -n $NAMESPACE deployment/backend --container=backend -- python manage.py createsuperuser"
-        echo ""
-        echo "3. Check database connection and list users:"
-        echo "   kubectl exec -n $NAMESPACE deployment/backend --container=backend -- python manage.py shell -c \"from django.contrib.auth import get_user_model; User = get_user_model(); print('Users:', User.objects.all().values_list('username', flat=True))\""
-        exit 1
-    fi
-fi
-echo ""
+#     if superuser_exists; then
+#         echo -e "${GREEN}✅ Superuser created and verified successfully${NC}"
+#     else
+#         echo -e "${RED}❌ Error: Superuser creation failed - user does not exist after creation attempt${NC}"
+#         echo ""
+#         echo -e "${YELLOW}Debugging information:${NC}"
+#         echo -e "${YELLOW}  Backend pod: $BACKEND_POD${NC}"
+#         echo -e "${YELLOW}  Username: $DJANGO_SUPERUSER_USERNAME${NC}"
+#         echo -e "${YELLOW}  Email: $DJANGO_SUPERUSER_EMAIL${NC}"
+#         echo ""
+#         echo -e "${YELLOW}Troubleshooting steps:${NC}"
+#         echo "1. Check backend logs:"
+#         echo "   kubectl logs -n $NAMESPACE deployment/backend --container=backend --tail=50"
+#         echo ""
+#         echo "2. Try to create superuser manually:"
+#         echo "   kubectl exec -it -n $NAMESPACE deployment/backend --container=backend -- python manage.py createsuperuser"
+#         echo ""
+#         echo "3. Check database connection and list users:"
+#         echo "   kubectl exec -n $NAMESPACE deployment/backend --container=backend -- python manage.py shell -c \"from django.contrib.auth import get_user_model; User = get_user_model(); print('Users:', User.objects.all().values_list('username', flat=True))\""
+#         exit 1
+#     fi
+# fi
+# echo ""
 
 # Step 8: Start port forwarding
 echo -e "${BLUE}Step 8: Starting port forwarding...${NC}"

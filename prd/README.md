@@ -37,18 +37,26 @@ All components run in a single Kubernetes namespace `packamal`:
 ### Start minikube
 
 ```bash
-minikube start
+minikube start --driver=docker --force-systemd=true --container-runtime=containerd
 ```
+
 
 ### Build local images and load to minikube
 
 PROJECT DIR SAMPLE: `/home/azureuser/packamal`
 
-```bash
-eval "$(minikube docker-env)"
+
+Run the following:
+```sh
+
 docker build -t packamal-backend:local /home/azureuser/packamal/backend
 docker build -t packamal-frontend:local /home/azureuser/packamal/frontend
 docker build -t packamal-go-worker-analysis:local -f /home/azureuser/packamal/worker/cmd/analyze/Dockerfile /home/azureuser/packamal/worker
+
+minikube image load packamal-backend:local 
+minikube image load packamal-frontend:local
+minikube image load packamal-go-worker-analysis:local
+
 ```
 
 ### Apply Kubernetes resources by phase
@@ -62,6 +70,7 @@ This script will:
 /home/azureuser/packamal/prd/apply-k8s.sh
 ```
 
+
 ### Create super user
 
 ```bash
@@ -74,16 +83,45 @@ kubectl exec -it -n packamal deployment/backend -- python manage.py createsuperu
 /home/azureuser/packamal/prd/port-forward-external.sh
 ```
 
+
+# Restarting
+```sh
+prd/restart_containerd_minikube.sh 
+```
+
+- Use `-w`: to build and load `go-heavy worker`
 # Testing
 
-You should login and create an API key before testing.
+You should log in and create an API key before testing.
 
 
-IP sample: `20.187.145.56`
+Example IP: `20.187.145.56`
 
 ```bash
 curl -X POST "http://20.187.145.56:8080/api/v1/analyze/" \
-  -H "Authorization: Bearer qBXbXoH8SI0W88RxJHkWV8OXfIjbZmpWIRj2ZCpaHZbjimzbrWPOwCrmWaWnDmoo" \
+  -H "Authorization: Bearer 0rslEeJnMdBZvSfpMyF2xKYWZDEzYHwZixO00p0l33D8RcO6bkRfYQ8hawIsLeZd" \
   -H "Content-Type: application/json" \
   -d '{"purl": "pkg:npm/lodash@4.17.21"}'
+```
+
+# Troubleshooting
+
+## Podman Cgroup Errors
+
+
+Check whether the Cgroup error is resolved:
+```bash
+kubectl exec -n packamal analysis-lodash-914f70e8-hdh4h   -- sh -lc '
+set -e
+mkdir -p /sys/fs/cgroup/libpod_parent/test
+echo $$ > /sys/fs/cgroup/libpod_parent/test/cgroup.procs
+echo "OK: cgroup.procs write works"
+'
+```
+
+For debugging: you should run a command to create a pod with `/bin/bash -c "sleep 3600"` in file `backend/package_analysis/services/k8s_service.py` to test the following command
+
+```bash
+❯ kubectl exec -it -n packamal analysis-<analysis-pod> -- /bin/bash
+root@analysis-lodash-914f70e8-hdh4h:/# analyze -ecosystem npm -package lodash -version 4.17.21 -mode dynamic -nopull -dynamic-bucket file:///results/
 ```
