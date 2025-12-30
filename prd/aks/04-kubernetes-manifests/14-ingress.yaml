@@ -1,0 +1,58 @@
+# Ingress Configuration for AKS
+# Requires NGINX Ingress Controller (see 01-infrastructure-setup.md)
+# Update hostname and TLS certificate before deploying
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: packamal-ingress
+  namespace: packamal
+  annotations:
+    # NGINX Ingress Controller annotations
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    # Cert-manager for TLS (if using)
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # Rate limiting
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - packamal.example.com
+        - api.packamal.example.com
+      secretName: packamal-tls
+  rules:
+    # Frontend
+    - host: packamal.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+    # Backend API
+    - host: api.packamal.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+

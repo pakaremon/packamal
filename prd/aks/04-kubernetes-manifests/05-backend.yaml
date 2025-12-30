@@ -1,0 +1,166 @@
+# Backend Deployment - AKS Optimized
+# Update ACR name and image tags before deploying
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: packamal
+spec:
+  replicas: 2  # Minimum 2 for HA
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+        version: v1
+    spec:
+      serviceAccountName: backend-serviceaccount
+      initContainers:
+        - name: init-dirs
+          image: busybox:1.36
+          command: ["sh", "-c", "mkdir -p /mnt/shared/static /mnt/shared/media"]
+          volumeMounts:
+            - name: app-shared
+              mountPath: /mnt/shared
+
+        - name: django-setup
+          # Update with your ACR name
+          image: packamalacr.azurecr.io/packamal-backend:latest
+          imagePullPolicy: Always  # Use Always or specific tag
+          envFrom:
+            - configMapRef:
+                name: packamal-config
+            - secretRef:
+                name: packamal-secrets
+          env:
+            - name: STATIC_ROOT
+              value: "/mnt/shared/static"
+            - name: MEDIA_ROOT
+              value: "/mnt/shared/media"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "Waiting for database..."
+              python -c "
+              import socket, time, os
+              s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              while True:
+                  try:
+                      host = os.environ.get('POSTGRES_HOST', 'database')
+                      port = int(os.environ.get('POSTGRES_PORT', 5432))
+                      s.connect((host, port))
+                      s.close()
+                      break
+                  except Exception as e:
+                      print(f'Waiting for {host}:{port}... {e}')
+                      time.sleep(2)
+              "
+              echo "Database is up! Running migrations..."
+              python manage.py migrate --noinput --skip-checks
+              echo "Collecting static files to $STATIC_ROOT..."
+              python manage.py collectstatic --noinput
+          volumeMounts:
+            - name: app-shared
+              mountPath: /mnt/shared
+              
+      containers:
+        - name: backend
+          # Update with your ACR name
+          image: packamalacr.azurecr.io/packamal-backend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: packamal-config
+            - secretRef:
+                name: packamal-secrets
+          command: ["gunicorn"]
+          args:
+            - packamal.wsgi:application
+            - --bind
+            - 0.0.0.0:8000
+            - --workers
+            - "4"
+            - --threads
+            - "2"
+            - --timeout
+            - "300"
+            - --access-logfile
+            - "-"
+            - --error-logfile
+            - "-"
+          volumeMounts:
+            - name: app-shared
+              mountPath: /app/staticfiles
+              subPath: static
+            - name: app-shared
+              mountPath: /app/media
+              subPath: media
+            - name: results-storage
+              mountPath: /data/results
+          resources:
+            requests:
+              cpu: 500m  # Increased for production
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+              - ALL
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes:
+        - name: app-shared
+          persistentVolumeClaim:
+            claimName: app-shared-pvc
+        - name: results-storage
+          persistentVolumeClaim:
+            claimName: analysis-results-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: packamal
+  labels:
+    app: backend
+spec:
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+  type: ClusterIP
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
+

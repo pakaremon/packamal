@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: packamal-config
+  namespace: packamal
+data:
+  # Django
+  DEBUG: "False"
+  # Update with your domain/IP
+  ALLOWED_HOSTS: "packamal.example.com,*.packamal.example.com"
+  # CSRF trusted origins - update with your domain
+  CSRF_TRUSTED_ORIGINS: "https://packamal.example.com,https://*.packamal.example.com"
+
+  # Postgres
+  POSTGRES_DB: "packamal"
+  POSTGRES_USER: "packamal_db"
+  POSTGRES_HOST: "database"
+  POSTGRES_PORT: "5432"
+
+  # Redis / Celery
+  CELERY_BROKER_URL: "redis://redis:6379/0"
+  CELERY_RESULT_BACKEND: "redis://redis:6379/0"
+  REDIS_URL: "redis://redis:6379/0"
+
+  # Application Configuration
+  API_URL: "http://backend:8000/api/v1/internal/callback/done/"
+  RESULTS_VOLUME: "analysis_results"
+  CONTAINER_DIR_OVERRIDE: "/tmp/container-lib"
+  # Update with your ACR name
+  ANALYSIS_IMAGE: "packamalacr.azurecr.io/packamal-go-worker-analysis:latest"
+  SANDBOX_DYNAMIC_ANALYSIS_IMAGE: "docker.io/pakaremon/dynamic-analysis"
+

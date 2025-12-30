@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: packamal
+  labels:
+    # Pod Security Standards - privileged required for analysis jobs with Podman
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: restricted
+    # Network policy label
+    name: packamal
+
