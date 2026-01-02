@@ -7,7 +7,7 @@ metadata:
   name: backend
   namespace: packamal
 spec:
-  replicas: 2  # Minimum 2 for HA
+  replicas: 1  # Scaled down to 1 for resource optimization
   selector:
     matchLabels:
       app: backend

@@ -4,7 +4,7 @@ metadata:
   name: celery-worker-2
   namespace: packamal
 spec:
-  replicas: 1
+  replicas: 0  # Disabled - using only celery-worker
   selector:
     matchLabels:
       app: celery-worker-2

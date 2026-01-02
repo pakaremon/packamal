@@ -4,7 +4,7 @@ metadata:
   name: flower
   namespace: packamal
 spec:
-  replicas: 1
+  replicas: 0  # Disabled
   selector:
     matchLabels:
       app: flower

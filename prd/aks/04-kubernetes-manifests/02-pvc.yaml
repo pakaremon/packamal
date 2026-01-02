@@ -43,6 +43,9 @@ spec:
     requests:
       storage: 10Gi  # Increased for production
 ---
+# Shared storage for analysis results
+# Using Azure Files (azurefile-csi) for ReadWriteMany to allow multiple pods
+# (backend + analysis jobs) to mount simultaneously
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -50,8 +53,8 @@ metadata:
   namespace: packamal
 spec:
   accessModes:
-    - ReadWriteOnce
-  storageClassName: managed-csi  # AKS default premium storage class
+    - ReadWriteMany  # Required for backend and analysis jobs to mount simultaneously
+  storageClassName: azurefile-csi  # Azure Files supports RWX access mode
   resources:
     requests:
       storage: 50Gi  # Increased for production

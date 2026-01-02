@@ -1,11 +1,12 @@
 apiVersion: apps/v1
-kind: DaemonSet
+kind: Deployment
 metadata:
   name: image-preloader
   namespace: packamal
   labels:
     app: image-preloader
 spec:
+  replicas: 1  # Single replica instead of DaemonSet (1 per node)
   selector:
     matchLabels:
       app: image-preloader
