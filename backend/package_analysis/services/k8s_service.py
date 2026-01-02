@@ -35,7 +35,7 @@ class K8sService:
         job_name = f"analysis-{package_name.replace('_', '-')}-{job_id}"
 
         resources = client.V1ResourceRequirements(
-            requests={"cpu": "1", "memory": "2Gi"},  # Reduced CPU request to fit available resources
+            requests={"cpu": "250m", "memory": "2Gi"},  # Reduced CPU request to fit available resources (250m = 0.25 CPU)
             limits={"cpu": "2", "memory": "4Gi"},     # Can burst up to 2 CPUs if available
         )
 

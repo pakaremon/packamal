@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker-2
+  namespace: packamal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: celery-worker-2
+  template:
+    metadata:
+      labels:
+        app: celery-worker-2
+    spec:
+      serviceAccountName: backend-serviceaccount
+      containers:
+        - name: celery-worker-2
+          # Reuses the backend image; runs the Celery worker for maintenance and celery queues.
+          image: packamalacr.azurecr.io/packamal-backend:latest
+          imagePullPolicy: Always  # Use Always for production or specific tags
+          envFrom:
+            - configMapRef:
+                name: packamal-config
+            - secretRef:
+                name: packamal-secrets
+          # Override the image ENTRYPOINT (which runs migrations/collectstatic) to avoid N workers racing on startup.
+          # Still waits for Postgres before starting.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until nc -z database 5432; do
+                echo "Waiting for database..."
+                sleep 0.5
+              done
+              exec celery -A packamal worker -l info -n worker2@%h -Q maintenance,celery
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+

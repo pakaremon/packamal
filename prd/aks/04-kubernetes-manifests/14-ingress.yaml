@@ -22,32 +22,14 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - packamal.example.com
-        - api.packamal.example.com
+        - packguard.dev
       secretName: packamal-tls
   rules:
-    # Frontend
-    - host: packamal.example.com
+    # Frontend - root path
+    - host: packguard.dev
       http:
         paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: frontend
-                port:
-                  number: 80
-    # Backend API
-    - host: api.packamal.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: backend
-                port:
-                  number: 8000
+          # Backend API - must come before frontend to match /api first
           - path: /api
             pathType: Prefix
             backend:
@@ -55,4 +37,19 @@ spec:
                 name: backend
                 port:
                   number: 8000
+          - path: /admin
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          # Frontend - catch-all for static content
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
 

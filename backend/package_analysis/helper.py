@@ -9,19 +9,12 @@ from .services.repository_service import RepositoryService
 from .services.execution_service import ExecutionService
 from .services.file_service import FileService
 from .services.k8s_service import K8sService
-# Configure helper logging
-current_path = os.path.dirname(os.path.abspath(__file__))
-log_file = os.path.join(current_path, "logs", "helper.log")
-# if os.path.exists(log_file):
-#     try:
-#         os.remove(log_file)
-#     except Exception:
-#         pass
-os.makedirs(os.path.dirname(log_file), exist_ok=True)
+# Configure helper logging - use console only for containerized environments
+# File logging removed to avoid permission issues in Kubernetes
 logger = log_function_output(
     file_level=logging.DEBUG,
-    console_level=logging.CRITICAL,
-    log_filepath=log_file,
+    console_level=logging.DEBUG,  # Changed from CRITICAL to DEBUG to see logs in stdout
+    log_filepath=None,  # No file logging - logs go to stdout/stderr for Kubernetes
 )
 
 

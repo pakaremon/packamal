@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: packamal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          # Build from /frontend/Dockerfile
+          image: packamalacr.azurecr.io/packamal-frontend:latest
+          imagePullPolicy: Always  # Use Always for production or specific tags
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: app-shared
+              mountPath: /usr/share/nginx/html/static
+              subPath: static
+              readOnly: true
+            - name: app-shared
+              mountPath: /usr/share/nginx/html/media
+              subPath: media
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: app-shared
+          persistentVolumeClaim:
+            claimName: app-shared-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: packamal
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: LoadBalancer
+
+

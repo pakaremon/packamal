@@ -1,5 +1,6 @@
 # Persistent Volume Claims using Azure managed premium disks
-# Storage class 'managed-premium' should be created (see 01-infrastructure-setup.md)
+# AKS default storage class 'managed-csi' or 'default' provides premium disks
+# For custom storage class, use: managed-csi-premium
 
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -9,7 +10,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: managed-premium
+  storageClassName: managed-csi  # AKS default premium storage class
   resources:
     requests:
       storage: 20Gi  # Increased for production
@@ -22,13 +23,13 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: managed-premium
+  storageClassName: managed-csi  # AKS default premium storage class
   resources:
     requests:
       storage: 5Gi  # Increased for production
 ---
 # Shared storage for static files and media
-# Note: For ReadWriteMany, consider Azure Files (azurefile-csi storage class)
+# Using Azure Files (azurefile-csi) for ReadWriteMany to allow multiple pods to mount
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -36,8 +37,8 @@ metadata:
   namespace: packamal
 spec:
   accessModes:
-    - ReadWriteOnce  # For RWO, only one pod can mount. For RWX, use azurefile-csi
-  storageClassName: managed-premium
+    - ReadWriteMany  # Required for multiple pods (frontend + backend) to mount simultaneously
+  storageClassName: azurefile-csi  # Azure Files supports RWX access mode
   resources:
     requests:
       storage: 10Gi  # Increased for production
@@ -50,7 +51,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: managed-premium
+  storageClassName: managed-csi  # AKS default premium storage class
   resources:
     requests:
       storage: 50Gi  # Increased for production

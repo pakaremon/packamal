@@ -19,8 +19,14 @@ from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 from django.views.static import serve
+from django.http import JsonResponse
+
+def health_check(request):
+    """Health check endpoint for Kubernetes readiness/liveness probes"""
+    return JsonResponse({'status': 'healthy'}, status=200)
 
 urlpatterns = [
+    path('health', health_check, name='health'),
     path('', include('package_analysis.urls')),
     path('admin/', admin.site.urls),
     # path('package-analysis/', include('package_analysis.urls')),

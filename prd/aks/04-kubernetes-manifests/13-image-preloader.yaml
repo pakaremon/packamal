@@ -1,0 +1,168 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: image-preloader
+  namespace: packamal
+  labels:
+    app: image-preloader
+spec:
+  selector:
+    matchLabels:
+      app: image-preloader
+  template:
+    metadata:
+      labels:
+        app: image-preloader
+    spec:
+      # Use hostNetwork and hostPID for better access to node's container runtime
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: image-preloader
+        # Use the analysis image which has podman available (same as analysis jobs)
+        # This ensures we use the same tool (podman) that analysis jobs use
+        image: packamalacr.azurecr.io/packamal-go-worker-analysis:latest
+        imagePullPolicy: Always  # Use Always for production or specific tags
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          echo "=== Image Pre-loader DaemonSet ==="
+          echo "Pre-pulling 10GB heavy image: docker.io/pakaremon/dynamic-analysis:latest"
+          echo "This ensures analysis jobs start instantly using node's local cache."
+          echo ""
+          
+          # Wait a bit for podman to be ready
+          sleep 5
+          
+          PULL_SUCCESS=false
+          
+          # Method 1: Use podman to pull into /var/lib/containers (podman's storage)
+          # This is the same location used by analysis jobs via hostPath mount
+          if command -v podman &> /dev/null; then
+            echo "Method 1: Using podman to pre-load image into /var/lib/containers..."
+            echo "This is the storage location shared with analysis jobs via hostPath mount."
+            
+            # Configure podman to use the mounted /var/lib/containers (hostPath)
+            # Podman will store images here, and analysis jobs can access them via the same mount
+            if podman pull docker.io/pakaremon/dynamic-analysis:latest; then
+              echo "✓ Successfully pre-loaded with podman"
+              podman images | grep "pakaremon/dynamic-analysis" || true
+              PULL_SUCCESS=true
+            else
+              echo "Warning: podman pull failed, trying alternative method..."
+            fi
+          else
+            echo "podman not found, trying crictl..."
+          fi
+          
+          # Method 2: Also try crictl for containerd-based clusters (fallback)
+          # This ensures the image is available even if podman method fails
+          if command -v crictl &> /dev/null; then
+            echo ""
+            echo "Method 2: Using crictl to pre-load image into containerd cache..."
+            
+            # Wait for containerd socket
+            MAX_RETRIES=30
+            RETRY_COUNT=0
+            while [ ! -S /run/containerd/containerd.sock ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              echo "Waiting for containerd socket... (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
+              sleep 2
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+            done
+            
+            if [ -S /run/containerd/containerd.sock ]; then
+              export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+              export IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock
+              
+              if crictl pull docker.io/pakaremon/dynamic-analysis:latest; then
+                echo "✓ Successfully pre-loaded with crictl into containerd"
+                crictl images | grep "pakaremon/dynamic-analysis" || true
+                PULL_SUCCESS=true
+              else
+                echo "Warning: crictl pull failed"
+              fi
+            else
+              echo "Warning: containerd socket not available"
+            fi
+          fi
+          
+          if [ "$PULL_SUCCESS" = true ]; then
+            echo ""
+            echo "=== Pre-loading Complete ==="
+            echo "✓ Image docker.io/pakaremon/dynamic-analysis:latest is now cached on this node"
+            echo "✓ Analysis jobs will use this cached image via hostPath mount (/var/lib/containers)"
+            echo "✓ Jobs with imagePullPolicy: IfNotPresent will start instantly"
+          else
+            echo ""
+            echo "ERROR: Failed to pre-load image with any method"
+            echo "Analysis jobs will need to pull this 10GB image at runtime (10-20 min delay)"
+            exit 1
+          fi
+          
+          # Keep container running to maintain the pre-loaded image in cache
+          echo ""
+          echo "Container will keep running to maintain image cache..."
+          sleep infinity
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+        volumeMounts:
+        # Mount container storage - podman stores images here
+        # This is the SAME path used by analysis jobs via hostPath, enabling image sharing
+        # Analysis jobs mount /var/lib/containers as hostPath, so they can access
+        # images pre-pulled by this DaemonSet
+        - name: container-storage
+          mountPath: /var/lib/containers
+          readOnly: false
+        # Mount containerd socket for crictl fallback method
+        - name: containerd-sock
+          mountPath: /run/containerd
+          readOnly: false
+        # Mount cgroup filesystem for podman (required for podman to work)
+        - name: sys-fs-cgroup
+          mountPath: /sys/fs/cgroup
+          readOnly: false
+        # Mount CNI paths (may be needed for podman networking)
+        - name: cni-bin
+          mountPath: /opt/cni/bin
+        - name: cni-cache
+          mountPath: /var/lib/cni
+      volumes:
+      # Mount container storage location - CRITICAL for nested container support
+      # Podman stores images in /var/lib/containers. By mounting this as hostPath,
+      # images pre-pulled by this DaemonSet are available to analysis jobs which
+      # also mount /var/lib/containers as hostPath. This enables instant startup
+      # without re-downloading the 10GB image.
+      - name: container-storage
+        hostPath:
+          path: /var/lib/containers
+          type: DirectoryOrCreate
+      # Mount containerd socket for crictl fallback method (containerd-based clusters)
+      - name: containerd-sock
+        hostPath:
+          path: /run/containerd
+          type: DirectoryOrCreate
+      # Mount cgroup filesystem for podman to manage cgroups properly
+      - name: sys-fs-cgroup
+        hostPath:
+          path: /sys/fs/cgroup
+          type: Directory
+      # Mount CNI paths for podman networking (if needed)
+      - name: cni-bin
+        hostPath:
+          path: /opt/cni/bin
+      - name: cni-cache
+        hostPath:
+          path: /var/lib/cni
+      tolerations:
+      # Allow running on all nodes including master/control plane
+      - operator: Exists
+

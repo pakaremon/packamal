@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-namespace.yaml
+  - 01-config.yaml
+  - 02-pvc.yaml
+  - 11-rbac.yaml
+  - 03-postgres.yaml
+  - 04-redis.yaml
+  - 05-backend.yaml
+  - 12-backend-hpa.yaml
+  - 06-worker.yaml
+  - 08-worker-2.yaml
+  - 09-celery-beat.yaml
+  - 10-flower.yaml
+  - 07-frontend.yaml
+  - 13-image-preloader.yaml
+
+
+

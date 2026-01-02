@@ -5,11 +5,12 @@
 This directory contains Kubernetes manifests optimized for Azure Kubernetes Service (AKS). These manifests are adapted from the Minikube versions with the following changes:
 
 1. **Image References**: Updated to use Azure Container Registry (ACR)
-2. **Storage Classes**: Using Azure managed premium disks
-3. **Service Types**: LoadBalancer for external services
+2. **Storage Classes**: Using Azure managed CSI premium disks (`managed-csi`)
+3. **Service Types**: ClusterIP with Ingress for external access
 4. **Security**: Enhanced security contexts and pod security
-5. **Networking**: Optimized for Azure networking
+5. **Networking**: Optimized for Azure networking with NGINX Ingress
 6. **Resource Limits**: Adjusted for AKS node sizes
+7. **ACR Integration**: ACR attached to AKS (no imagePullSecrets needed)
 
 ## Deployment Order
 
@@ -64,15 +65,19 @@ Before deploying, update:
 | Component | Minikube | AKS |
 |-----------|----------|-----|
 | Images | `packamal-*:local` | `acr.azurecr.io/packamal-*:tag` |
-| Storage | Local volumes | Azure managed disks |
-| Services | NodePort | LoadBalancer/Ingress |
+| Storage | Local volumes | Azure managed CSI disks (`managed-csi`) |
+| Services | NodePort | ClusterIP with Ingress |
 | Image Pull | `IfNotPresent` | `Always` (or specific tag) |
 | HostPath | Used for containers | Azure Disk preferred |
+| Storage Class | Default | `managed-csi` (premium) |
 
 ## Notes
 
+- **ACR Integration**: ACR is attached to AKS via `az aks update --attach-acr`, so no imagePullSecrets are required
 - The image preloader (13-image-preloader.yaml) is optional but recommended for the 10GB analysis image
 - Analysis jobs require privileged mode for Podman - this is configured in the RBAC
-- All persistent volumes use `managed-premium` storage class
+- All persistent volumes use `managed-csi` storage class (AKS default premium storage)
 - Network policies are configured separately (see 03-security-rbac.md)
+- **Secrets**: Currently using inline secrets for testing. For production, use Azure Key Vault with Secrets Store CSI Driver
+- **Ingress**: Requires NGINX Ingress Controller installed in the cluster
 

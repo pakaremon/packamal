@@ -29,18 +29,21 @@ def log_function_output(file_level: str, console_level: str, log_filepath: str =
     logger.addHandler(console_logger)
 
     logger.propagate = False
-    # Setting logging for file
-    if log_filepath is None:
-        log_dir = Path().resolve().parent / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_filename = "logs.log"
-        log_file = log_dir / log_filename 
-    else:
-        log_file = os.path.abspath(log_filepath)
-    file_logger = logging.FileHandler(str(log_file))
-    file_logger.setLevel(file_level)
-    file_message = logging.Formatter("%(asctime)s - %(lineno)d - %(levelname)-8s $ %(message)s $ {}".format(function_name))
-    file_logger.setFormatter(file_message)
-    logger.addHandler(file_logger)
+    # Setting logging for file (optional - only if log_filepath is provided and writable)
+    if log_filepath is not None:
+        try:
+            log_file = os.path.abspath(log_filepath)
+            log_dir = os.path.dirname(log_file)
+            # Only create directory and file handler if we can write to it
+            os.makedirs(log_dir, exist_ok=True)
+            file_logger = logging.FileHandler(str(log_file))
+            file_logger.setLevel(file_level)
+            file_message = logging.Formatter("%(asctime)s - %(lineno)d - %(levelname)-8s $ %(message)s $ {}".format(function_name))
+            file_logger.setFormatter(file_message)
+            logger.addHandler(file_logger)
+        except (PermissionError, OSError) as e:
+            # If file logging fails (e.g., permission denied), just use console logging
+            # This is expected in containerized environments where we log to stdout/stderr
+            pass
 
     return logger
