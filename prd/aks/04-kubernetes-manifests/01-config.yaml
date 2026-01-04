@@ -27,7 +27,7 @@ data:
   RESULTS_VOLUME: "analysis_results"
   CONTAINER_DIR_OVERRIDE: "/tmp/container-lib"
   # Update with your ACR name
-  ANALYSIS_IMAGE: "packamalacr.azurecr.io/packamal-go-worker-analysis:latest"
+  ANALYSIS_IMAGE: "packamalacr.azurecr.io/packamal-go-worker-analysis"
   SANDBOX_DYNAMIC_ANALYSIS_IMAGE: "docker.io/pakaremon/dynamic-analysis"
 
 ---

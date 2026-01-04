@@ -20,7 +20,7 @@ jobs:
   build-and-push:
     name: Build and Push Images
     runs-on: ubuntu-latest
-    steps:
+    steps:  
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -120,7 +120,8 @@ jobs:
           sed -i "s|${ACR_REGISTRY}/${BACKEND_IMAGE}:.*|${ACR_REGISTRY}/${BACKEND_IMAGE}:${COMMIT_SHA}|g" prd/aks/04-kubernetes-manifests/06-worker.yaml
           
           # Update Go worker image in 01-config.yaml (ANALYSIS_IMAGE)
-          sed -i "s|${ACR_REGISTRY}/${WORKER_IMAGE}:.*|${ACR_REGISTRY}/${WORKER_IMAGE}:${COMMIT_SHA}|g" prd/aks/04-kubernetes-manifests/01-config.yaml
+          # Handle both cases: with tag (replace) and without tag (append colon and tag)
+          sed -i -E "s|(\"${ACR_REGISTRY}/${WORKER_IMAGE})(:[^\"]*)?(\")|\1:${COMMIT_SHA}\3|g" prd/aks/04-kubernetes-manifests/01-config.yaml
           
           # Update Go worker image in 13-image-preloader.yaml
           sed -i "s|${ACR_REGISTRY}/${WORKER_IMAGE}:.*|${ACR_REGISTRY}/${WORKER_IMAGE}:${COMMIT_SHA}|g" prd/aks/04-kubernetes-manifests/13-image-preloader.yaml
@@ -145,7 +146,11 @@ jobs:
       - name: Deploy to AKS
         run: |
           echo "Deploying all manifests to namespace: ${{ env.NAMESPACE }}"
-          kubectl apply -f prd/aks/04-kubernetes-manifests/ --namespace ${{ env.NAMESPACE }}
+          # Apply all YAML files except kustomization.yaml and example files
+          find prd/aks/04-kubernetes-manifests/ -name "*.yaml" \
+            ! -name "kustomization.yaml" \
+            ! -name "*.example" \
+            -exec kubectl apply -f {} --namespace ${{ env.NAMESPACE }} \;
 
       - name: Wait for backend rollout
         run: |
