@@ -4,7 +4,7 @@ metadata:
   name: celery-beat
   namespace: packamal
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app: celery-beat

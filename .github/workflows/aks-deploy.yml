@@ -1,0 +1,189 @@
+name: AKS Deploy Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  ACR_NAME: packamalacr
+  ACR_REGISTRY: packamalacr.azurecr.io
+  AKS_NAME: packamal-aks
+  RESOURCE_GROUP: packamal-rg
+  NAMESPACE: packamal
+  BACKEND_IMAGE: packamal-backend
+  FRONTEND_IMAGE: packamal-frontend
+  WORKER_IMAGE: packamal-go-worker-analysis
+
+jobs:
+  build-and-push:
+    name: Build and Push Images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push Backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.ACR_REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+            ${{ env.ACR_REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.ACR_REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.ACR_REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache,mode=max
+
+      - name: Build and push Frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.ACR_REGISTRY }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+            ${{ env.ACR_REGISTRY }}/${{ env.FRONTEND_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.ACR_REGISTRY }}/${{ env.FRONTEND_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.ACR_REGISTRY }}/${{ env.FRONTEND_IMAGE }}:buildcache,mode=max
+
+      - name: Build and push Go Worker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./worker
+          file: ./worker/cmd/analyze/Dockerfile
+          push: true
+          tags: |
+            ${{ env.ACR_REGISTRY }}/${{ env.WORKER_IMAGE }}:${{ github.sha }}
+            ${{ env.ACR_REGISTRY }}/${{ env.WORKER_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.ACR_REGISTRY }}/${{ env.WORKER_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.ACR_REGISTRY }}/${{ env.WORKER_IMAGE }}:buildcache,mode=max
+
+  deploy:
+    name: Deploy to AKS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.AKS_NAME }} \
+            --overwrite-existing
+
+      - name: Verify kubectl connection
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Update image tags in Kubernetes manifests
+        run: |
+          COMMIT_SHA="${{ github.sha }}"
+          ACR_REGISTRY="${{ env.ACR_REGISTRY }}"
+          BACKEND_IMAGE="${{ env.BACKEND_IMAGE }}"
+          FRONTEND_IMAGE="${{ env.FRONTEND_IMAGE }}"
+          WORKER_IMAGE="${{ env.WORKER_IMAGE }}"
+          
+          echo "Updating image tags to commit SHA: $COMMIT_SHA"
+          echo "ACR Registry: $ACR_REGISTRY"
+          echo "Backend Image: $BACKEND_IMAGE"
+          echo "Frontend Image: $FRONTEND_IMAGE"
+          echo "Worker Image: $WORKER_IMAGE"
+          
+          # Update backend image in 05-backend.yaml (2 occurrences: initContainer and main container)
+          sed -i "s|${ACR_REGISTRY}/${BACKEND_IMAGE}:.*|${ACR_REGISTRY}/${BACKEND_IMAGE}:${COMMIT_SHA}|g" prd/aks/04-kubernetes-manifests/05-backend.yaml
+          
+          # Update frontend image in 07-frontend.yaml
+          sed -i "s|${ACR_REGISTRY}/${FRONTEND_IMAGE}:.*|${ACR_REGISTRY}/${FRONTEND_IMAGE}:${COMMIT_SHA}|g" prd/aks/04-kubernetes-manifests/07-frontend.yaml
+          
+          # Update worker image in 06-worker.yaml (celery worker uses backend image)
+          sed -i "s|${ACR_REGISTRY}/${BACKEND_IMAGE}:.*|${ACR_REGISTRY}/${BACKEND_IMAGE}:${COMMIT_SHA}|g" prd/aks/04-kubernetes-manifests/06-worker.yaml
+          
+          # Update Go worker image in 01-config.yaml (ANALYSIS_IMAGE)
+          sed -i "s|${ACR_REGISTRY}/${WORKER_IMAGE}:.*|${ACR_REGISTRY}/${WORKER_IMAGE}:${COMMIT_SHA}|g" prd/aks/04-kubernetes-manifests/01-config.yaml
+          
+          # Update Go worker image in 13-image-preloader.yaml
+          sed -i "s|${ACR_REGISTRY}/${WORKER_IMAGE}:.*|${ACR_REGISTRY}/${WORKER_IMAGE}:${COMMIT_SHA}|g" prd/aks/04-kubernetes-manifests/13-image-preloader.yaml
+          
+          # Update worker-2.yaml (celery-worker-2 uses backend image)
+          sed -i "s|${ACR_REGISTRY}/${BACKEND_IMAGE}:.*|${ACR_REGISTRY}/${BACKEND_IMAGE}:${COMMIT_SHA}|g" prd/aks/04-kubernetes-manifests/08-worker-2.yaml
+          
+          echo ""
+          echo "Image tags updated successfully"
+          echo "Verifying changes:"
+          echo "--- Backend images ---"
+          grep -n "${ACR_REGISTRY}/${BACKEND_IMAGE}" prd/aks/04-kubernetes-manifests/*.yaml || true
+          echo "--- Frontend images ---"
+          grep -n "${ACR_REGISTRY}/${FRONTEND_IMAGE}" prd/aks/04-kubernetes-manifests/*.yaml || true
+          echo "--- Worker images ---"
+          grep -n "${ACR_REGISTRY}/${WORKER_IMAGE}" prd/aks/04-kubernetes-manifests/*.yaml || true
+
+      - name: Ensure namespace exists
+        run: |
+          kubectl create namespace ${{ env.NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to AKS
+        run: |
+          echo "Deploying all manifests to namespace: ${{ env.NAMESPACE }}"
+          kubectl apply -f prd/aks/04-kubernetes-manifests/ --namespace ${{ env.NAMESPACE }}
+
+      - name: Wait for backend rollout
+        run: |
+          kubectl rollout status deployment/backend -n ${{ env.NAMESPACE }} --timeout=5m
+
+      - name: Wait for frontend rollout
+        run: |
+          kubectl rollout status deployment/frontend -n ${{ env.NAMESPACE }} --timeout=5m
+
+      - name: Wait for celery-worker rollout
+        run: |
+          kubectl rollout status deployment/celery-worker -n ${{ env.NAMESPACE }} --timeout=5m
+
+      - name: Verify deployments
+        run: |
+          echo "=== Deployment Status ==="
+          kubectl get deployments -n ${{ env.NAMESPACE }}
+          echo ""
+          echo "=== Pod Status ==="
+          kubectl get pods -n ${{ env.NAMESPACE }}
+          echo ""
+          echo "=== Service Status ==="
+          kubectl get services -n ${{ env.NAMESPACE }}
+          echo ""
+          echo "=== Image Versions ==="
+          kubectl get deployments -n ${{ env.NAMESPACE }} -o jsonpath='{range .items[*]}{.metadata.name}{":\t"}{.spec.template.spec.containers[*].image}{"\n"}{end}'
+
+      - name: Health check
+        run: |
+          echo "Checking pod health..."
+          kubectl get pods -n ${{ env.NAMESPACE }} -o wide
+          
+          # Check if pods are running
+          FAILED_PODS=$(kubectl get pods -n ${{ env.NAMESPACE }} --field-selector=status.phase!=Running,status.phase!=Succeeded --no-headers 2>/dev/null | wc -l)
+          if [ "$FAILED_PODS" -gt 0 ]; then
+            echo "Warning: Some pods are not in Running state"
+            kubectl get pods -n ${{ env.NAMESPACE }} --field-selector=status.phase!=Running,status.phase!=Succeeded
+          else
+            echo "✓ All pods are running successfully"
+          fi
+

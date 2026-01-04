@@ -35,7 +35,7 @@ class K8sService:
         job_name = f"analysis-{package_name.replace('_', '-')}-{job_id}"
 
         resources = client.V1ResourceRequirements(
-            requests={"cpu": "250m", "memory": "2Gi"},  # Reduced CPU request to fit available resources (250m = 0.25 CPU)
+            requests={"cpu": "100m", "memory": "2Gi"},  # Reduced CPU request to fit available resources (250m = 0.25 CPU)
             limits={"cpu": "2", "memory": "4Gi"},     # Can burst up to 2 CPUs if available
         )
 
@@ -81,10 +81,14 @@ class K8sService:
         # Define the container with your specific command and arguments
         # For local development, use local image; for production, use registry image
         analysis_image = os.environ.get("ANALYSIS_IMAGE", "packamal-go-worker-analysis:local")
+        logger.info(f"Using analysis image: {analysis_image}")
+        
         # Use IfNotPresent to leverage node's local image cache
         # The image-preloader DaemonSet ensures the heavy dynamic-analysis image
         # (10GB) is pre-pulled to every node, so analysis jobs start instantly
         # using the cached image instead of downloading over the network
+        # NOTE: If image doesn't exist locally, it will try to pull from registry
+        # For ACR images, ensure the node pool has proper authentication configured
         pull_policy = "IfNotPresent"
         
         container = client.V1Container(
@@ -181,10 +185,18 @@ class K8sService:
 
         try:
             logger.info(f"Submitting Job {job_name} to K8s...")
+            logger.info(f"  Image: {analysis_image}")
+            logger.info(f"  ImagePullPolicy: {pull_policy}")
+            logger.info(f"  PVC: analysis-results-pvc")
+            logger.info(f"  ServiceAccount: backend-serviceaccount")
             self.batch_v1.create_namespaced_job(namespace=self.namespace, body=job)
+            logger.info(f"Job {job_name} created successfully")
             return job_name
         except client.exceptions.ApiException as e:
-            logger.error(f"K8s API Error: {e}")
+            logger.error(f"K8s API Error creating job {job_name}: {e}")
+            logger.error(f"  Status: {e.status}")
+            logger.error(f"  Reason: {e.reason}")
+            logger.error(f"  Body: {e.body}")
             raise e
 
     def get_job(self, job_name: str) -> client.V1Job:
