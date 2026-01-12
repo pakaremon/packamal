@@ -50,12 +50,21 @@ fi
 
 echo ""
 
+# Phase 0: Cluster-scoped resources (PriorityClass)
+echo -e "${YELLOW}Phase 0: Applying cluster-scoped resources (PriorityClass)...${NC}"
+# PriorityClass is cluster-wide (not namespaced) and may require cluster-admin.
+kubectl apply -f "${AKS_MANIFESTS_DIR}/12-priority-class.yaml" 2>/dev/null || echo -e "${YELLOW}  ⚠️  Could not apply PriorityClass (check cluster RBAC)${NC}"
+echo -e "${GREEN}✅ Phase 0 complete${NC}"
+echo ""
+
 # Phase 1: Core infrastructure (namespace, config, storage, RBAC)
-echo -e "${YELLOW}Phase 1: Applying namespace, config, secrets, PVCs, and RBAC...${NC}"
+echo -e "${YELLOW}Phase 1: Applying namespace, quota, config, secrets, PVCs, and RBAC...${NC}"
 kubectl apply -f "${AKS_MANIFESTS_DIR}/00-namespace.yaml"
+kubectl apply -f "${AKS_MANIFESTS_DIR}/11-resource-quota.yaml"
 kubectl apply -f "${AKS_MANIFESTS_DIR}/01-config.yaml"
 kubectl apply -f "${AKS_MANIFESTS_DIR}/02-pvc.yaml"
 kubectl apply -f "${AKS_MANIFESTS_DIR}/11-rbac.yaml"
+
 
 # Wait for ServiceAccount to be ready
 echo -e "${YELLOW}  Waiting for ServiceAccount to be ready...${NC}"
@@ -162,6 +171,12 @@ kubectl get pods -n "${NAMESPACE}" -o wide
 echo ""
 echo -e "${YELLOW}Service status:${NC}"
 kubectl get svc -n "${NAMESPACE}"
+
+# Phase 6: Eraser cleanup cronjob
+echo -e "${YELLOW}Phase 6: Applying Eraser cleanup cronjob...${NC}"
+kubectl apply -f "${AKS_MANIFESTS_DIR}/15-eraser-cleanup-cronjob.yaml"
+echo -e "${GREEN}✅ Phase 6 complete${NC}"
+echo ""
 
 # Check ingress
 echo ""

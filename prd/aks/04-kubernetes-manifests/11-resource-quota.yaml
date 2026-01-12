@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: packamal-resource-quota
+  namespace: packamal
+spec:
+  hard:
+    # Tăng từ 1500m lên 2500m để cho phép scale backend lên 2-3 replicas
+    # Node capacity: 2 nodes × 1900m = 3800m total
+    # Giữ headroom ~1300m cho kube-system và system pods
+    requests.cpu: "2500m"
+    requests.memory: "8Gi"  # Tăng từ 6Gi lên 8Gi để phù hợp với CPU increase
+    limits.cpu: "6"  # Tăng từ 4 lên 6 để cho phép burst khi cần
+    # 2 nodes x ~5.6Gi allocatable ~= ~11Gi total; keep headroom for kube-system.
+    limits.memory: "12Gi"  # Tăng từ 10Gi lên 12Gi
+

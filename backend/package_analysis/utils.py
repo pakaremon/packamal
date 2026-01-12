@@ -60,8 +60,10 @@ class PURLParser:
             qualifiers = cls._parse_qualifiers(qualifiers_part)
         
         # Check for version (after @)
+        # Use rsplit to handle scoped packages like @babel/core@1.0.0
+        # where @ appears in the package name (scope) and version separator
         if '@' in rest:
-            name_part, version = rest.split('@', 1)
+            name_part, version = rest.rsplit('@', 1)
             version = unquote(version)
         else:
             name_part = rest

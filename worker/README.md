@@ -337,6 +337,15 @@ Key options include:
 - `-sandbox-image` - Override default sandbox image
 - `-analysis-command` - Override default analysis script path
 
+#### Customised analysis script
+
+To modify the default analysis script (see in [worker/sandboxes/dynamicanalysis](worker/sandboxes/dynamicanalysis))do the following instruction: 
+
+The custom script must be accessible inside the Docker container. You'll need to either:
+
+Option A: Mount your local script into the container by modifying the Docker command
+Option B: Build a custom sandbox image that includes your script
+Option C: Copy your script into the container at runtime
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on contributing to this project.

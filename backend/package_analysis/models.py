@@ -45,7 +45,7 @@ class APIKey(models.Model):
     key = models.CharField(max_length=64, unique=True, help_text="The actual API key")
     created_at = models.DateTimeField(auto_now_add=True)
     is_active = models.BooleanField(default=True)
-    rate_limit_per_hour = models.IntegerField(default=100, help_text="Maximum requests per hour")
+    rate_limit_per_hour = models.IntegerField(default=1000, help_text="Maximum requests per hour")
     last_used = models.DateTimeField(null=True, blank=True)
     
     def save(self, *args, **kwargs):
@@ -67,12 +67,12 @@ class APIKey(models.Model):
 class AnalysisTask(models.Model):
     """Model to track API analysis requests"""
     STATUS_CHOICES = [
-        ('pending', 'Pending'),
-        ('queued', 'Queued'),
-        ('submitted', 'Submitted'),  # Job submitted to K8s, waiting for completion
-        ('running', 'Running'),
-        ('completed', 'Completed'),
-        ('failed', 'Failed'),
+        ('received', 'Received'),     # Mới tạo record trong DB
+        ('queued', 'Queued'),         # Đã đẩy vào Celery (Redis) để chờ K8sService xử lý
+        ('processing', 'Processing'), # Đã gọi API K8s thành công (Thay cho submitted/running)
+        ('completed', 'Completed'),   # Worker báo về thành công hoặc Watcher thấy Job Succeeded
+        ('failed', 'Failed'),         # Lỗi ứng dụng, lỗi code Go
+        ('timeout', 'Timeout'),       # Bị K8s giết do chạy quá deadline (activeDeadlineSeconds)
     ]
     
     api_key = models.ForeignKey(APIKey, on_delete=models.CASCADE, related_name='analysis_tasks')
@@ -80,7 +80,7 @@ class AnalysisTask(models.Model):
     package_name = models.CharField(max_length=200, blank=True)
     package_version = models.CharField(max_length=100, blank=True)
     ecosystem = models.CharField(max_length=50, blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='received')
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
@@ -90,10 +90,7 @@ class AnalysisTask(models.Model):
     report = models.OneToOneField(ReportDynamicAnalysis, on_delete=models.SET_NULL, null=True, blank=True)
     download_url = models.URLField(blank=True, null=True, help_text="URL to download the analysis report JSON file")
     
-    # Queue management fields
-    queue_position = models.PositiveIntegerField(null=True, blank=True, help_text="Position in the analysis queue")
     priority = models.PositiveIntegerField(default=0, help_text="Priority level (higher number = higher priority)")
-    queued_at = models.DateTimeField(null=True, blank=True, help_text="When the task was added to the queue")
     
     # Timeout management fields
     timeout_minutes = models.PositiveIntegerField(default=30, help_text="Timeout in minutes for this task")
@@ -101,11 +98,11 @@ class AnalysisTask(models.Model):
     last_heartbeat = models.DateTimeField(null=True, blank=True, help_text="Last heartbeat from running container")
     
     # K8s Job tracking
-    job_id = models.CharField(max_length=50, blank=True, null=True, db_index=True, help_text="K8s job ID for tracking")
+    job_id = models.CharField(max_length=50, blank=True, null=True, db_index=True, help_text="K8s job name for tracking")
     
     def is_timed_out(self):
         """Check if this task has exceeded its timeout."""
-        if self.status != 'running' or not self.started_at:
+        if self.status != 'processing' or not self.started_at:
             return False
         
         from django.utils import timezone
@@ -114,7 +111,7 @@ class AnalysisTask(models.Model):
     
     def get_remaining_time_minutes(self):
         """Get remaining time in minutes before timeout."""
-        if self.status != 'running' or not self.started_at:
+        if self.status != 'processing' or not self.started_at:
             return None
         
         from django.utils import timezone
@@ -130,8 +127,6 @@ class AnalysisTask(models.Model):
             models.Index(fields=['purl']),
             models.Index(fields=['status', 'created_at']),
             models.Index(fields=['api_key', 'created_at']),
-            models.Index(fields=['status', 'queue_position']),
-            models.Index(fields=['priority', 'queued_at']),
             models.Index(fields=['status', 'started_at']),
             models.Index(fields=['container_id']),
             models.Index(fields=['job_id']),

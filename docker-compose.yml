@@ -77,7 +77,7 @@ services:
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - RESULTS_VOLUME=analysis_results
       - INTERNAL_API_TOKEN=Rthj7yHEBt9Fp3A9BHfmfsDcuIPItWOnSkRNy4euus5825cAd8ho4J4CRLfOmCM2
-      - API_URL=http://backend:8000/api/v1/internal/callback/done/
+      - INTERNAL_API_BASE_URL=http://backend:8000/api/v1/internal/callback
     depends_on:
       database:
         condition: service_healthy
@@ -111,7 +111,7 @@ services:
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - CONTAINER_DIR_OVERRIDE=/tmp/container-lib
       - INTERNAL_API_TOKEN=Rthj7yHEBt9Fp3A9BHfmfsDcuIPItWOnSkRNy4euus5825cAd8ho4J4CRLfOmCM2
-      - API_URL=http://backend:8000/api/v1/internal/callback/done/
+      - INTERNAL_API_BASE_URL=http://backend:8000/api/v1/internal/callback
     depends_on:
       - redis
       - database
@@ -142,7 +142,7 @@ services:
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - CONTAINER_DIR_OVERRIDE=/tmp/container-lib
       - INTERNAL_API_TOKEN=Rthj7yHEBt9Fp3A9BHfmfsDcuIPItWOnSkRNy4euus5825cAd8ho4J4CRLfOmCM2
-      - API_URL=http://backend:8000/api/v1/internal/callback/done/
+      - INTERNAL_API_BASE_URL=http://backend:8000/api/v1/internal/callback
     depends_on:
       - redis
       - database
@@ -170,7 +170,7 @@ services:
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - CONTAINER_DIR_OVERRIDE=/tmp/container-lib
       - INTERNAL_API_TOKEN=Rthj7yHEBt9Fp3A9BHfmfsDcuIPItWOnSkRNy4euus5825cAd8ho4J4CRLfOmCM2
-      - API_URL=http://backend:8000/api/v1/internal/callback/done/
+      - INTERNAL_API_BASE_URL=http://backend:8000/api/v1/internal/callback
     depends_on:
       - redis
       - database
@@ -192,7 +192,7 @@ services:
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - CONTAINER_DIR_OVERRIDE=/tmp/container-lib
       - INTERNAL_API_TOKEN=Rthj7yHEBt9Fp3A9BHfmfsDcuIPItWOnSkRNy4euus5825cAd8ho4J4CRLfOmCM2
-      - API_URL=http://backend:8000/api/v1/internal/callback/done/
+      - INTERNAL_API_BASE_URL=http://backend:8000/api/v1/internal/callback
     volumes:
       - ./backend:/app
     depends_on:

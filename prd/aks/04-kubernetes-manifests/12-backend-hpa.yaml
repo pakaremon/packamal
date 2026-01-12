@@ -8,8 +8,8 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: backend
-  minReplicas: 1  # Keep at 1 to match deployment replicas
-  maxReplicas: 10
+  minReplicas: 1  # Giảm xuống 1 để phù hợp với tài nguyên hiện có
+  maxReplicas: 3  # Giảm max từ 5 xuống 3 để tránh chiếm hết tài nguyên
   metrics:
     # Scale based on CPU utilization
     - type: Resource
@@ -17,14 +17,14 @@ spec:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: 70
+          averageUtilization: 85  # Tăng threshold từ 70% lên 85% để tránh scale up sớm
     # Scale based on memory utilization
     - type: Resource
       resource:
         name: memory
         target:
           type: Utilization
-          averageUtilization: 80
+          averageUtilization: 90  # Tăng threshold từ 80% lên 90% để tránh scale up sớm
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 300  # Wait 5 minutes before scaling down

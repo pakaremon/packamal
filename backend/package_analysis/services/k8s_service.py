@@ -2,6 +2,7 @@ from kubernetes import client, config
 import logging
 import uuid
 import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +13,11 @@ try:
 except ImportError:
     DJANGO_AVAILABLE = False
     django_settings = None
+
+MAX_K8S_RESOURCE_NAME_LENGTH = 253
+MAX_PACKAGE_NAME_LENGTH = 200
+DEFAULT_PACKAGE_NAME = "pkg"
+NPM_SCOPE_PREFIX = "@"
 
 class K8sService:
     def __init__(self):
@@ -29,24 +35,91 @@ class K8sService:
         self.namespace = "packamal"
         self.sandbox_dynamic_analysis_image = os.environ.get("SANDBOX_DYNAMIC_ANALYSIS_IMAGE", "docker.io/pakaremon/dynamic-analysis")
 
+    @staticmethod
+    def _remove_npm_scope_prefix(name: str) -> str:
+        """Remove leading @ from npm scoped package names."""
+        return name.lstrip(NPM_SCOPE_PREFIX)
+
+    @staticmethod
+    def _replace_invalid_characters(name: str) -> str:
+        """Replace invalid characters with hyphens and convert to lowercase."""
+        return re.sub(r'[^a-z0-9.-]', '-', name.lower())
+
+    @staticmethod
+    def _normalize_separators(name: str) -> str:
+        """Replace multiple consecutive hyphens or dots with a single hyphen."""
+        return re.sub(r'[-.]+', '-', name)
+
+    @staticmethod
+    def _ensure_alphanumeric_boundaries(name: str) -> str:
+        """Remove leading and trailing hyphens/dots to ensure alphanumeric boundaries."""
+        return name.strip('-.')
+
+    @staticmethod
+    def _ensure_non_empty(name: str) -> str:
+        """Return default name if empty after sanitization."""
+        return name if name else DEFAULT_PACKAGE_NAME
+
+    @staticmethod
+    def _truncate_to_max_length(name: str) -> str:
+        """Truncate name to maximum allowed length."""
+        if len(name) <= MAX_PACKAGE_NAME_LENGTH:
+            return name
+        truncated = name[:MAX_PACKAGE_NAME_LENGTH]
+        return truncated.rstrip('-.')
+
+    @staticmethod
+    def _sanitize_for_k8s_name(name: str) -> str:
+        """
+        Sanitize a package name to be RFC 1123 compliant for Kubernetes resource names.
+        
+        Kubernetes resource names must:
+        - Consist of lowercase alphanumeric characters, '-' or '.'
+        - Start and end with an alphanumeric character
+        - Be at most 253 characters (we'll truncate if needed)
+        
+        Args:
+            name: Package name (e.g., "@babel/core", "django_utils")
+            
+        Returns:
+            Sanitized name safe for Kubernetes (e.g., "babel-core", "django-utils")
+        """
+        sanitized = K8sService._remove_npm_scope_prefix(name)
+        sanitized = K8sService._replace_invalid_characters(sanitized)
+        sanitized = K8sService._normalize_separators(sanitized)
+        sanitized = K8sService._ensure_alphanumeric_boundaries(sanitized)
+        sanitized = K8sService._ensure_non_empty(sanitized)
+        sanitized = K8sService._truncate_to_max_length(sanitized)
+        return sanitized
+
     def run_analysis(self, ecosystem, package_name, task_id, package_version="latest"):
-        # Generate a unique job name
+        # Generate a unique job name using sanitized package name
+        # The original package_name is preserved for the analysis command args
         job_id = str(uuid.uuid4())[:8]
-        job_name = f"analysis-{package_name.replace('_', '-')}-{job_id}"
+        sanitized_package_name = self._sanitize_for_k8s_name(package_name)
+        job_name = f"analysis-{sanitized_package_name}-{job_id}"
 
         resources = client.V1ResourceRequirements(
             requests={"cpu": "100m", "memory": "2Gi"},  # Reduced CPU request to fit available resources (250m = 0.25 CPU)
-            limits={"cpu": "2", "memory": "4Gi"},     # Can burst up to 2 CPUs if available
+            limits={"cpu": "1.5", "memory": "3.5Gi"},     # Can burst up to 2 CPUs if available
         )
 
         env_vars = [
+            # Single internal callback base URL.
+            # Go worker will append /done/ or /timeout/ automatically.
             client.V1EnvVar(
-                name="API_URL",
-                value=os.environ.get("API_URL", "http://backend:8000/api/v1/internal/callback/done/")
+                name="INTERNAL_API_BASE_URL",
+                value=os.environ.get("INTERNAL_API_BASE_URL", "http://backend:8000/api/v1/internal/callback")
             ),
             client.V1EnvVar(
                 name="TASK_ID",
                 value=str(task_id)  # Kubernetes requires string values for env vars
+            ),
+            # Tier-1 Graceful Timeout: maximum execution time for the Go worker itself.
+            # Format: Go time.ParseDuration, e.g. "30m", "1h".
+            client.V1EnvVar(
+                name="ANALYSIS_TIMEOUT",
+                value=os.environ.get("ANALYSIS_TIMEOUT", "30m")
             ),
             # INTERNAL_API_TOKEN must be injected from the Kubernetes Secret to ensure
             # the heavy worker can authenticate back to the backend API.
@@ -150,15 +223,28 @@ class K8sService:
         # Keeping hostPID disabled still allows privileged podman-in-pod usage
         # while avoiding PID/cgroup namespace mismatches.
         # - hostNetwork=False keeps network isolation for security
+        tolerations = [
+            # Allow scheduling heavy analysis jobs onto a tainted "heavy-analysis" node pool:
+            #   kubectl taint nodes <node-name> heavy-analysis=true:NoSchedule
+            client.V1Toleration(
+                key="heavy-analysis",
+                operator="Equal",
+                value="true",
+                effect="NoSchedule",
+            )
+        ]
+
         template = client.V1PodTemplateSpec(
             metadata=client.V1ObjectMeta(labels={"app": "analysis-job"}),
             spec=client.V1PodSpec(
                 restart_policy="Never",
                 service_account_name="backend-serviceaccount",
+                priority_class_name="packamal-app-priority",
                 containers=[container],
                 volumes=volumes,
                 host_pid=False,
                 host_network=False,  # Keep network isolation
+                tolerations=tolerations,
             )
         )
         # Define the Job specification
@@ -169,10 +255,15 @@ class K8sService:
         # 
         # OPTIMIZATION: The dynamic-analysis image is pre-loaded on all nodes via the image-preloader DaemonSet
         # (see prd/k8s/13-image-preloader.yaml). This significantly reduces image pull time during analysis.
+        
+        # Read pod timeout from config (default: 60 minutes = 3600 seconds)
+        pod_timeout_seconds = int(os.environ.get("POD_TIMEOUT_SECONDS", "3600"))
+        
         job_spec = client.V1JobSpec(
             template=template,
             backoff_limit=0,  # Do not retry if the analysis fails
-            ttl_seconds_after_finished=300 # Cleanup Pod 5 mins after completion
+            ttl_seconds_after_finished=600,  # Cleanup Pod 10 mins after completion
+            active_deadline_seconds=pod_timeout_seconds  # Maximum time pod can run (30 minutes default)
         )
 
         # Create the Job object
@@ -235,6 +326,40 @@ class K8sService:
         return self.core_v1.list_namespaced_pod(
             namespace=self.namespace,
             label_selector=label_selector,
+        )
+
+    def list_pods(
+        self,
+        namespace: str | None = None,
+        label_selector: str | None = None,
+        field_selector: str | None = None,
+    ) -> client.V1PodList:
+        """
+        List Pods in a namespace, optionally filtered by label/field selectors.
+
+        This is used by periodic maintenance tasks (e.g. eraser zombie cleanup)
+        that need to inspect Pods outside the default application namespace.
+        """
+        return self.core_v1.list_namespaced_pod(
+            namespace=namespace or self.namespace,
+            label_selector=label_selector,
+            field_selector=field_selector,
+        )
+
+    def delete_pod(
+        self,
+        pod_name: str,
+        namespace: str | None = None,
+        grace_period_seconds: int = 0,
+    ) -> None:
+        """
+        Delete a Pod. For emergency cleanup, set grace_period_seconds=0.
+        """
+        body = client.V1DeleteOptions(grace_period_seconds=grace_period_seconds)
+        self.core_v1.delete_namespaced_pod(
+            name=pod_name,
+            namespace=namespace or self.namespace,
+            body=body,
         )
 
     def get_pod_logs(self, pod_name: str, container: str | None = None, tail_lines: int | None = 200) -> str:

@@ -32,20 +32,7 @@ def test_timeout_functionality():
     
     print()
     
-    # Test 2: Manually trigger timeout check
-    print("2. Manually triggering timeout check...")
-    check_result = trigger_timeout_check()
-    if check_result:
-        print(f"   ✅ Timeout check completed: {check_result.get('message', 'No message')}")
-        status = check_result.get('status', {})
-        print(f"   Running tasks after check: {status.get('running_tasks', 0)}")
-        print(f"   Timed out tasks after check: {status.get('timed_out_tasks', 0)}")
-    else:
-        print("   ❌ Timeout check failed")
-    
-    print()
-    
-    # Test 3: Check queue status
+    # Test 2: Check queue status
     print("3. Checking queue status...")
     queue_status = get_queue_status()
     if queue_status:
@@ -74,25 +61,6 @@ def get_timeout_status():
             
     except requests.exceptions.RequestException as e:
         print(f"   ❌ Timeout status check failed: {e}")
-        return None
-
-def trigger_timeout_check():
-    """Manually trigger timeout check."""
-    url = f"{BASE_URL}/api/v1/timeout/check/"
-    
-    try:
-        response = requests.post(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get('success'):
-            return data.get('data', {})
-        else:
-            print(f"   ❌ Timeout check failed: {data.get('error', 'Unknown error')}")
-            return None
-            
-    except requests.exceptions.RequestException as e:
-        print(f"   ❌ Timeout check failed: {e}")
         return None
 
 def get_queue_status():
@@ -160,14 +128,15 @@ if __name__ == "__main__":
     print()
     print("Expected behavior:")
     print("- Running tasks show remaining time")
-    print("- Timed out tasks are automatically cleaned up")
+    print("- Timeout checking is handled automatically by maintenance_sync_k8s_status (runs every 60s)")
+    print("- K8s jobs that exceed activeDeadlineSeconds are automatically marked as timeout")
     print("- Queue continues processing after timeout")
-    print("- Container logs are captured before cleanup")
     print()
     print("To test with a real task:")
     print("1. Submit an analysis request")
     print("2. Use monitor_running_task(task_id) to watch timeout behavior")
-    print("3. Check timeout status periodically")
+    print("3. Check timeout status periodically via /api/v1/timeout/status/")
+    print("4. Timeout detection happens automatically via K8s job status monitoring")
 
 
 

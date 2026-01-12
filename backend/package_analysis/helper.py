@@ -9,6 +9,7 @@ from .services.repository_service import RepositoryService
 from .services.execution_service import ExecutionService
 from .services.file_service import FileService
 from .services.k8s_service import K8sService
+from .config import ExecutionConfig
 # Configure helper logging - use console only for containerized environments
 # File logging removed to avoid permission issues in Kubernetes
 logger = log_function_output(
@@ -71,7 +72,11 @@ class Helper:
         local_path: Optional[str] = None,
     ):
         """
-        Run package analysis using either local execution (DEBUG) or K8s service.
+        Run package analysis using execution mode determined by ExecutionConfig.
+        
+        Execution modes:
+        - 'local': Local Docker execution via ExecutionService
+        - 'k8s' or 'production': K8s execution via K8sService
         
         Args:
             package_name: Name of the package to analyze.
@@ -83,21 +88,21 @@ class Helper:
         Returns:
             Analysis results dictionary.
         """
-        if settings.DEBUG:
-            return ExecutionService.run_packaml(
-                package_name=package_name,
-                package_version=package_version,
-                ecosystem=ecosystem,
-                task_id=task_id,
-                local_path=local_path,
-            )
-        else:
+        if ExecutionConfig.should_use_k8s_execution():
             k8s_service = K8sService()
             return k8s_service.run_analysis(
                 ecosystem=ecosystem,
                 package_name=package_name,
                 task_id=task_id,
                 package_version=package_version,
+            )
+        else:
+            return ExecutionService.run_packaml(
+                package_name=package_name,
+                package_version=package_version,
+                ecosystem=ecosystem,
+                task_id=task_id,
+                local_path=local_path,
             )
         
     @staticmethod

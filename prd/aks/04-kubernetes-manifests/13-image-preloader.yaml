@@ -110,10 +110,10 @@ spec:
           privileged: true
         resources:
           requests:
-            cpu: 100m
-            memory: 128Mi
+            cpu: 10m   # Chỉ pull image một lần, không cần giữ request lớn
+            memory: 64Mi
           limits:
-            cpu: 1000m
+            cpu: 50m
             memory: 512Mi
         volumeMounts:
         # Mount container storage - podman stores images here

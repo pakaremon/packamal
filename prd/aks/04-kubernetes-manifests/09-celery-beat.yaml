@@ -4,7 +4,7 @@ metadata:
   name: celery-beat
   namespace: packamal
 spec:
-  replicas: 0
+  replicas: 1 # Enabled - required for periodic maintenance tasks
   selector:
     matchLabels:
       app: celery-beat
@@ -32,16 +32,16 @@ spec:
                 echo "Waiting for database..."
                 sleep 0.5
               done
-              until nc -z redis 6379; do
-                echo "Waiting for Redis..."
+              until nc -z redis-celery 6379; do
+                echo "Waiting for Redis Celery..."
                 sleep 0.5
               done
               exec celery -A packamal beat -l info
           resources:
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: "50m"      # 0.05 Core
+              memory: "128Mi"
             limits:
-              cpu: 500m
-              memory: 512Mi
+              cpu: "50m"      # 0.05 Core
+              memory: "256Mi"
 

@@ -94,7 +94,7 @@ class AnalysisRunner:
         self,
         task_id: Optional[str] = None,
         internal_api_token: Optional[str] = None,
-        api_url: Optional[str] = None,
+        internal_api_base_url: Optional[str] = None,
     ) -> List[str]:
         """
         Build Docker environment variables.
@@ -102,7 +102,7 @@ class AnalysisRunner:
         Args:
             task_id: Task ID to pass to container (optional).
             internal_api_token: Internal API token for container (optional).
-            api_url: API URL for container (optional).
+            internal_api_base_url: INTERNAL API base URL for container callbacks (optional).
         
         Returns:
             List of Docker environment variable arguments.
@@ -113,8 +113,8 @@ class AnalysisRunner:
             env.extend(["-e", f"TASK_ID={task_id}"])
         if internal_api_token:
             env.extend(["-e", f"INTERNAL_API_TOKEN={internal_api_token}"])
-        if api_url:
-            env.extend(["-e", f"API_URL={api_url}"])
+        if internal_api_base_url:
+            env.extend(["-e", f"INTERNAL_API_BASE_URL={internal_api_base_url}"])
         
         return env
     
@@ -267,7 +267,8 @@ class AnalysisRunner:
         stream_output: bool = True,
         task_id: Optional[str] = None,
         internal_api_token: Optional[str] = None,
-        api_url: Optional[str] = None,
+        internal_api_base_url: Optional[str] = None,
+        api_url: Optional[str] = None,  # DEPRECATED: use internal_api_base_url
     ) -> Tuple[int, Optional[str]]:
         """
         Run package analysis in a Docker container.
@@ -310,7 +311,12 @@ class AnalysisRunner:
         # Build Docker command
         docker_opts = self._build_docker_opts(interactive=interactive, offline=offline)
         docker_mounts = self._build_docker_mounts(local_package_path=local_path)
-        docker_env = self._build_docker_env(task_id=task_id, internal_api_token=internal_api_token, api_url=api_url)
+        callback_base_url = internal_api_base_url or api_url
+        docker_env = self._build_docker_env(
+            task_id=task_id,
+            internal_api_token=internal_api_token,
+            internal_api_base_url=callback_base_url,
+        )
         analysis_args = self._build_analysis_args(
             ecosystem=ecosystem,
             package=package,
@@ -409,7 +415,8 @@ def run_packaml(
     logger_instance: Optional[logging.Logger] = None,
     task_id: Optional[str] = None,
     internal_api_token: Optional[str] = None,
-    api_url: Optional[str] = None,
+    internal_api_base_url: Optional[str] = None,
+    api_url: Optional[str] = None,  # DEPRECATED: use internal_api_base_url
 ) -> Dict:
     """
     Convenience function to run package analysis and return JSON results.
@@ -467,7 +474,7 @@ def run_packaml(
             stream_output=stream_output,
             task_id=task_id,
             internal_api_token=internal_api_token,
-            api_url=api_url,
+            internal_api_base_url=internal_api_base_url or api_url,
         )
     except subprocess.CalledProcessError as e:
         log.error(f"Analysis failed with return code {e.returncode}")

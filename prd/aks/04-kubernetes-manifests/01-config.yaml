@@ -5,7 +5,8 @@ metadata:
   namespace: packamal
 data:
   # Django
-  DEBUG: "False"
+  DEBUG: "True"
+  EXECUTION_MODE: "k8s"
   # Update with your domain/IP
   ALLOWED_HOSTS: "*,packguard.dev,135.233.163.34"
   # CSRF trusted origins - update with your domain
@@ -18,17 +19,32 @@ data:
   POSTGRES_PORT: "5432"
 
   # Redis / Celery
-  CELERY_BROKER_URL: "redis://redis:6379/0"
-  CELERY_RESULT_BACKEND: "redis://redis:6379/0"
-  REDIS_URL: "redis://redis:6379/0"
+  # Redis for Celery broker and result backend
+  CELERY_BROKER_URL: "redis://redis-celery:6379/0"
+  CELERY_RESULT_BACKEND: "redis://redis-celery:6379/0"
+  # Redis for report caching and Django cache
+  REDIS_CACHE_URL: "redis://redis-report:6379/0"
 
   # Application Configuration
-  API_URL: "http://backend:8000/api/v1/internal/callback/done/"
+  # Internal worker callback base URL (Go worker auto-appends /done/ and /timeout/)
+  INTERNAL_API_BASE_URL: "http://backend:8000/api/v1/internal/callback"
+  # Tier-1 Graceful Timeout: Go time.ParseDuration format (e.g. 30m, 1h)
+  ANALYSIS_TIMEOUT: "30m"
   RESULTS_VOLUME: "analysis_results"
   CONTAINER_DIR_OVERRIDE: "/tmp/container-lib"
   # Update with your ACR name
   ANALYSIS_IMAGE: "packamalacr.azurecr.io/packamal-go-worker-analysis:latest"
   SANDBOX_DYNAMIC_ANALYSIS_IMAGE: "docker.io/pakaremon/dynamic-analysis"
+  # Pod timeout in seconds (60 minutes = 3600 seconds)
+  POD_TIMEOUT_SECONDS: "3600"
+  # Maximum concurrent Go analysis pods (0 = unlimited, recommended: 4-6 based on node resources)
+  # For 2 small nodes (2 CPU, ~5.9Gi RAM each): cap concurrency to avoid OOM.
+  # Each analysis job requests 2Gi memory, limits 4Gi.
+  # Node capacity: ~5.9Gi allocatable × 2 nodes = ~11.8Gi total
+  # Max safe concurrent jobs: ~4-6 jobs (4 × 2Gi = 8Gi < 11.8Gi, còn headroom cho system pods)
+  # NOTE: Code MUST check this limit BEFORE creating new jobs, not just after job completes
+  # k exec -it -n packamal $(k get pod -n packamal -l app=backend -o jsonpath='{.items[0].metadata.name}') -- printenv MAX_CONCURRENT_JOBS
+  MAX_CONCURRENT_JOBS: "1"
 
 ---
 # NOTE: For production, use Azure Key Vault with Secrets Store CSI Driver

@@ -37,11 +37,11 @@ class ExecutionService:
         Retrieve environment variables for analysis execution.
         
         Returns:
-            tuple: (internal_api_token, api_url)
+            tuple: (internal_api_token, internal_api_base_url)
         """
         return (
             os.getenv("INTERNAL_API_TOKEN"),
-            os.getenv("API_URL"),
+            os.getenv("INTERNAL_API_BASE_URL") or os.getenv("API_URL"),
         )
 
     @staticmethod
@@ -82,7 +82,7 @@ class ExecutionService:
             ecosystem,
         )
 
-        internal_api_token, api_url = ExecutionService._get_environment_variables()
+        internal_api_token, internal_api_base_url = ExecutionService._get_environment_variables()
 
         try:
             from ..analysis_runner import run_packaml as runner_run_analysis
@@ -98,7 +98,7 @@ class ExecutionService:
                 logger_instance=logger,
                 task_id=task_id,
                 internal_api_token=internal_api_token,
-                api_url=api_url,
+                internal_api_base_url=internal_api_base_url,
             )
             
 
