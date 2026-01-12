@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"golang.org/x/exp/maps"
 	"golang.org/x/exp/slices"
@@ -47,9 +48,10 @@ var (
 	help               = flag.Bool("help", false, "print help on available options")
 	analysisMode       = utils.CommaSeparatedFlags("mode", []string{"static", "dynamic"},
 		"list of analysis modes to run, separated by commas. Use -list-modes to see available options")
-	taskID = flag.String("task-id", "", "task ID for completion signaling (or use TASK_ID env)")
-    internalAPIToken = flag.String("internal-api-token", "", "internal API token for completion signaling (or use INTERNAL_API_TOKEN env)")
-	apiURL = flag.String("api-url", "", "API URL for completion signaling (or use API_URL env)")
+	taskID             = flag.String("task-id", "", "task ID for completion signaling (or use TASK_ID env)")
+	internalAPIToken   = flag.String("internal-api-token", "", "internal API token for completion signaling (or use INTERNAL_API_TOKEN env)")
+	internalAPIBaseURL = flag.String("internal-api-base-url", "", "internal API base URL for callbacks (or use INTERNAL_API_BASE_URL env)")
+	apiURL             = flag.String("api-url", "", "DEPRECATED: full API URL for completion signaling; prefer INTERNAL_API_BASE_URL")
 )
 
 // usageError wraps an error, to signal that the error arises from incorrect user input.
@@ -133,7 +135,7 @@ func makeSandboxOptions() []sandbox.Option {
 	return sbOpts
 }
 
-func dynamicAnalysis(ctx context.Context, pkg *pkgmanager.Pkg, resultStores *worker.ResultStores) {
+func dynamicAnalysis(ctx context.Context, pkg *pkgmanager.Pkg, resultStores *worker.ResultStores, taskID string) {
 	if !*offline {
 		sandbox.InitNetwork(ctx)
 	}
@@ -157,7 +159,7 @@ func dynamicAnalysis(ctx context.Context, pkg *pkgmanager.Pkg, resultStores *wor
 			"status", string(result.LastStatus))
 	}
 
-	if err := worker.SaveDynamicAnalysisData(ctx, pkg, resultStores, result.Data); err != nil {
+	if err := worker.SaveDynamicAnalysisData(ctx, pkg, resultStores, result.Data, taskID); err != nil {
 		slog.ErrorContext(ctx, "Upload error", "error", err)
 	}
 }
@@ -227,7 +229,7 @@ func run() error {
 		return usagef("missing package name")
 	}
 
-// Get task ID, redis URL, and redis channel from command line flags or environment variables
+	// Get task ID, redis URL, and redis channel from command line flags or environment variables
 	taskID := *taskID
 	if taskID == "" {
 		taskID = os.Getenv("TASK_ID")
@@ -237,13 +239,10 @@ func run() error {
 			return usagef("missing task ID")
 		}
 	}
-	apiURL := *apiURL
-	if apiURL == "" {
-		apiURL = os.Getenv("API_URL")
-		if apiURL == "" {
-			slog.ErrorContext(context.Background(), "Missing API URL", "error", usagef("missing API URL"))
-			return usagef("missing API URL")
-		}
+	internalBaseURL := loadInternalAPIBaseURL()
+	if internalBaseURL == "" {
+		slog.ErrorContext(context.Background(), "Missing INTERNAL_API_BASE_URL", "error", usagef("missing INTERNAL_API_BASE_URL"))
+		return usagef("missing INTERNAL_API_BASE_URL")
 	}
 	internalAPIToken := *internalAPIToken
 	if internalAPIToken == "" {
@@ -259,9 +258,8 @@ func run() error {
 	// Initialize completion signaler (non-blocking, can be nil if no task_id)
 	var reporter *worker.CompletionReporter
 	if taskID != "" {
-		reporter = worker.NewCompletionReporter(taskID, apiURL, internalAPIToken)
+		reporter = worker.NewCompletionReporter(taskID, internalBaseURL, internalAPIToken)
 	}
-
 
 	runMode := make(map[analysis.Mode]bool)
 	for _, analysisName := range analysisMode.Values {
@@ -277,46 +275,138 @@ func run() error {
 		slog.Any("ecosystem", ecosystem),
 	)
 
+	// Tier-1 Graceful Timeout: wrap the main analysis flow with a context timeout.
+	timeoutStr := os.Getenv("ANALYSIS_TIMEOUT")
+	if timeoutStr == "" {
+		timeoutStr = "30m"
+	}
+	timeoutDur, err := time.ParseDuration(timeoutStr)
+	if err != nil {
+		slog.WarnContext(ctx, "Invalid ANALYSIS_TIMEOUT, falling back to default",
+			"value", timeoutStr,
+			"error", err,
+		)
+		timeoutDur = 30 * time.Minute
+	}
+	analysisCtx, cancel := context.WithTimeout(ctx, timeoutDur)
+	defer cancel()
+
 	slog.InfoContext(ctx, "Got request",
 		slog.String("requested_name", *pkgName),
 		slog.String("requested_version", *version),
 	)
 
-	pkg, err := worker.ResolvePkg(manager, *pkgName, *version, *localPkg)
-	if err != nil {
-		slog.ErrorContext(ctx, "Error resolving package", "error", err)
-		return err
+	doneCh := make(chan error, 1)
+	go func() {
+		pkg, err := worker.ResolvePkg(manager, *pkgName, *version, *localPkg)
+		if err != nil {
+			slog.ErrorContext(analysisCtx, "Error resolving package", "error", err)
+			doneCh <- err
+			return
+		}
+
+		flowCtx := log.ContextWithAttrs(analysisCtx,
+			slog.String("name", pkg.Name()),
+			slog.String("version", pkg.Version()),
+		)
+
+		slog.InfoContext(flowCtx, "Processing resolved package", "package_path", *localPkg)
+		resultStores := makeResultStores()
+
+		if runMode[analysis.Static] {
+			slog.InfoContext(flowCtx, "Starting static analysis")
+			staticAnalysis(flowCtx, pkg, &resultStores)
+		}
+
+		// dynamicAnalysis() currently panics on error, so it's last
+		if runMode[analysis.Dynamic] {
+			slog.InfoContext(flowCtx, "Starting dynamic analysis")
+			dynamicAnalysis(flowCtx, pkg, &resultStores, taskID)
+		}
+
+		doneCh <- nil
+	}()
+
+	select {
+	case <-analysisCtx.Done():
+		// IMPORTANT: analysisCtx is cancelled here. Use a fresh context for the callback.
+		cbCtx, cbCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cbCancel()
+
+		if errors.Is(analysisCtx.Err(), context.DeadlineExceeded) {
+			if reporter != nil {
+				if err := reporter.SendFinalStatus(cbCtx, "timeout", "Execution time exceeded"); err != nil {
+					slog.ErrorContext(ctx, "Failed to send timeout final status", "error", err)
+				}
+			}
+			return analysisCtx.Err()
+		}
+
+		// Other cancellations (rare in this worker) just propagate.
+		return analysisCtx.Err()
+
+	case err := <-doneCh:
+		if err != nil {
+			cbCtx, cbCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cbCancel()
+			if reporter != nil {
+				if sendErr := reporter.SendFinalStatus(cbCtx, "failed", err.Error()); sendErr != nil {
+					slog.ErrorContext(ctx, "Failed to send failure final status", "error", sendErr)
+				}
+			}
+			return err
+		}
+
+		// Completion callback should be bounded and must not block shutdown for long periods.
+		cbCtx, cbCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cbCancel()
+		if reporter != nil {
+			if sendErr := reporter.ReportDone(cbCtx, "done"); sendErr != nil {
+				slog.ErrorContext(ctx, "Failed to report completion", "error", sendErr)
+				// Don't fail the entire run if signaling fails.
+			}
+		}
+		return nil
+	}
+}
+
+func loadInternalAPIBaseURL() string {
+	if *internalAPIBaseURL != "" {
+		return normalizeInternalAPIBaseURL(*internalAPIBaseURL)
 	}
 
-	ctx = log.ContextWithAttrs(ctx,
-		slog.String("name", pkg.Name()),
-		slog.String("version", pkg.Version()),
-	)
-
-	slog.InfoContext(ctx, "Processing resolved package", "package_path", *localPkg)
-	resultStores := makeResultStores()
-
-	if runMode[analysis.Static] {
-		slog.InfoContext(ctx, "Starting static analysis")
-		staticAnalysis(ctx, pkg, &resultStores)
+	if env := os.Getenv("INTERNAL_API_BASE_URL"); env != "" {
+		return normalizeInternalAPIBaseURL(env)
 	}
 
-	// dynamicAnalysis() currently panics on error, so it's last
-	if runMode[analysis.Dynamic] {
-		slog.InfoContext(ctx, "Starting dynamic analysis")
-		dynamicAnalysis(ctx, pkg, &resultStores)
+	// Backward-compat: allow legacy full URLs and normalize them back to a base URL.
+	// Backward-compat: older deployments may still set API_URL.
+	// BACKEND_CALLBACK_URL is removed in favor of INTERNAL_API_BASE_URL.
+	if legacy := firstNonEmpty(os.Getenv("API_URL"), *apiURL); legacy != "" {
+		return normalizeInternalAPIBaseURL(legacy)
 	}
 
-	// Signal completion
-	analysisStatus := "done"
-	if reporter != nil {
-		if err := reporter.ReportDone(ctx, analysisStatus); err != nil {
-			slog.ErrorContext(ctx, "Failed to report completion", "error", err)
-			// Don't fail the entire run if signaling fails
+	return ""
+}
+
+func normalizeInternalAPIBaseURL(value string) string {
+	trimmed := strings.TrimSpace(value)
+	trimmed = strings.TrimRight(trimmed, "/")
+	// If a legacy full endpoint URL is provided, strip known suffixes.
+	trimmed = strings.TrimSuffix(trimmed, "/done")
+	trimmed = strings.TrimSuffix(trimmed, "/done/")
+	trimmed = strings.TrimSuffix(trimmed, "/timeout")
+	trimmed = strings.TrimSuffix(trimmed, "/timeout/")
+	return strings.TrimRight(trimmed, "/")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
 		}
 	}
-
-	return nil
+	return ""
 }
 
 func main() {

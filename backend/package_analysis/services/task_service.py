@@ -8,12 +8,16 @@ from django.db import transaction
 from django.conf import settings
 from ..models import AnalysisTask
 from ..view_constants import (
+    STATUS_RECEIVED,
     STATUS_QUEUED,
+    STATUS_PROCESSING,
     STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_TIMEOUT,
+    # Legacy status constants for backward compatibility
     STATUS_RUNNING,
     STATUS_PENDING,
     STATUS_SUBMITTED,
-    STATUS_FAILED,
     ACTIVE_TASK_WINDOW_HOURS,
     RACE_CONDITION_CHECK_MINUTES,
 )
@@ -33,11 +37,11 @@ class TaskService:
 
     @staticmethod
     def find_active_tasks_by_purl(purl: str):
-        """Find active tasks (running, queued, pending) for a PURL within time window."""
+        """Find active tasks (processing, queued, received) for a PURL within time window."""
         time_threshold = timezone.now() - timezone.timedelta(hours=ACTIVE_TASK_WINDOW_HOURS)
         return AnalysisTask.objects.filter(
             purl=purl,
-            status__in=[STATUS_RUNNING, STATUS_QUEUED, STATUS_PENDING],
+            status__in=[STATUS_PROCESSING, STATUS_QUEUED, STATUS_RECEIVED],
             created_at__gte=time_threshold
         ).order_by('-created_at')
 
@@ -66,38 +70,20 @@ class TaskService:
             package_name=package_name,
             package_version=package_version,
             ecosystem=ecosystem,
-            status=STATUS_PENDING,
+            status=STATUS_RECEIVED,
             priority=priority,
         )
 
     @staticmethod
     def queue_task(task: AnalysisTask) -> None:
-        """Mark task as queued and calculate queue position."""
-        with transaction.atomic():
-            task.status = STATUS_QUEUED
-            task.queued_at = timezone.now()
-            queued_count = AnalysisTask.objects.filter(
-                status=STATUS_QUEUED
-            ).exclude(id=task.id).count()
-            task.queue_position = queued_count + 1
-            task.save()
+        """Mark task as queued."""
+        task.status = STATUS_QUEUED
+        task.save()
 
     @staticmethod
-    def calculate_queue_position(task: AnalysisTask) -> int:
-        """Calculate queue position for a task."""
-        queued_count = AnalysisTask.objects.filter(
-            status=STATUS_QUEUED
-        ).exclude(id=task.id).count()
-        return queued_count + 1
-
-    @staticmethod
-    def get_queue_position_for_status(task: AnalysisTask) -> Optional[int]:
-        """Get queue position based on task status."""
-        if task.status == STATUS_QUEUED:
-            return task.queue_position
-        if task.status == STATUS_RUNNING:
-            return 0
-        return None
+    def mark_task_as_queued(task: AnalysisTask) -> None:
+        """Mark task as queued (alias for queue_task for consistency)."""
+        TaskService.queue_task(task)
 
     @staticmethod
     def mark_task_as_failed(task: AnalysisTask, error_message: str, error_category: str = 'unknown') -> None:
@@ -110,18 +96,18 @@ class TaskService:
 
     @staticmethod
     def can_update_task_status(task: AnalysisTask) -> bool:
-        """Check if task status can be updated (must be running or submitted)."""
-        return task.status in [STATUS_RUNNING, STATUS_SUBMITTED]
+        """Check if task status can be updated (must be processing)."""
+        return task.status == STATUS_PROCESSING
 
     @staticmethod
     def get_all_queued_tasks():
-        """Get all queued tasks ordered by position."""
+        """Get all queued tasks ordered by priority and creation time."""
         return AnalysisTask.objects.filter(
             status=STATUS_QUEUED
-        ).order_by('queue_position')
+        ).order_by('-priority', 'created_at')
 
     @staticmethod
     def get_all_running_tasks():
-        """Get all running tasks."""
-        return AnalysisTask.objects.filter(status=STATUS_RUNNING)
+        """Get all processing tasks."""
+        return AnalysisTask.objects.filter(status=STATUS_PROCESSING)
 

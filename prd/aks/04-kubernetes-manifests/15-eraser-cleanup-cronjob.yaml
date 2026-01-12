@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: eraser-cleanup-sa
+  namespace: packamal
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eraser-cleanup-pod-deleter
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eraser-cleanup-pod-deleter-binding
+subjects:
+  - kind: ServiceAccount
+    name: eraser-cleanup-sa
+    namespace: packamal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: eraser-cleanup-pod-deleter
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: eraser-zombie-cleanup
+  namespace: packamal
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: eraser-cleanup-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: cleanup
+              image: bitnami/kubectl:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  NS="kube-system"
+
+                  # Try a few common label selectors for Azure Managed Image Cleaner (eraser).
+                  # Primary selector is the one you've been using in manual cleanup.
+                  SELECTORS="
+                  app.kubernetes.io/name=image-cleaner
+                  app=image-cleaner
+                  k8s-app=image-cleaner
+                  "
+
+                  deleted_any="false"
+
+                  for SEL in $SELECTORS; do
+                    echo "== Checking selector: ${SEL} (namespace: ${NS}) =="
+
+                    POD_LINES="$(kubectl get pods -n "${NS}" -l "${SEL}" \
+                      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.status.reason}{"\t"}{range .status.containerStatuses[*]}{.state.waiting.reason}{" "}{.state.terminated.reason}{" "}{.lastState.terminated.reason}{" "}{end}{"\n"}{end}' 2>/dev/null || true)"
+
+                    [ -n "${POD_LINES}" ] || continue
+
+                    IFS_OLD="${IFS}"
+                    IFS="$(printf '\n')"
+                    for LINE in ${POD_LINES}; do
+                      [ -n "${LINE}" ] || continue
+                      NAME="$(printf '%s' "${LINE}" | cut -f1)"
+                      PHASE="$(printf '%s' "${LINE}" | cut -f2)"
+                      REASON="$(printf '%s' "${LINE}" | cut -f3)"
+                      DETAILS="$(printf '%s' "${LINE}" | cut -f4-)"
+
+                      # Requested conditions:
+                      # - status.phase: Failed
+                      # - status.reason: Evicted (often appears with phase=Failed)
+                      # - Error (may appear as status.reason or as container state reason)
+                      if [ "${PHASE}" = "Failed" ] || [ "${REASON}" = "Evicted" ] || [ "${REASON}" = "Error" ] || echo "${DETAILS}" | grep -Eq '\b(Evicted|Error)\b'; then
+                        echo "Deleting pod: ${NAME} (phase=${PHASE}, reason=${REASON}, details=${DETAILS})"
+                        kubectl delete pod -n "${NS}" "${NAME}" --ignore-not-found=true --force --grace-period=0 >/dev/null 2>&1 || true
+                        deleted_any="true"
+                      fi
+                    done
+                    IFS="${IFS_OLD}"
+                  done
+
+                  if [ "${deleted_any}" = "false" ]; then
+                    echo "No zombie eraser pods matched (Failed/Evicted/Error)."
+                  fi
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 50m
+                  memory: 64Mi
+

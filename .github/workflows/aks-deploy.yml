@@ -191,4 +191,3 @@ jobs:
           else
             echo "✓ All pods are running successfully"
           fi
-

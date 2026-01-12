@@ -109,12 +109,14 @@ Managed service provides:
 
 ### Redis Backup
 
+**Note**: Only `redis-celery` is backed up. `redis-report` uses ephemeral storage and does not require backups.
+
 ```yaml
-# redis-backup-cronjob.yaml
+# redis-celery-backup-cronjob.yaml
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: redis-backup
+  name: redis-celery-backup
   namespace: packamal
 spec:
   schedule: "0 3 * * *"  # Daily at 3 AM
@@ -129,13 +131,13 @@ spec:
             - /bin/sh
             - -c
             - |
-              redis-cli -h redis SAVE
+              redis-cli -h redis-celery SAVE
               cp /data/dump.rdb /backup/dump-$(date +%Y%m%d).rdb
               az storage blob upload \
                 --account-name $AZURE_STORAGE_ACCOUNT \
                 --account-key $AZURE_STORAGE_KEY \
                 --container-name redis-backups \
-                --name dump-$(date +%Y%m%d).rdb \
+                --name celery-dump-$(date +%Y%m%d).rdb \
                 --file /backup/dump-$(date +%Y%m%d).rdb
             volumeMounts:
             - name: redis-data
@@ -146,7 +148,7 @@ spec:
           volumes:
           - name: redis-data
             persistentVolumeClaim:
-              claimName: redis-pvc
+              claimName: redis-celery-pvc
           - name: backup
             emptyDir: {}
           restartPolicy: OnFailure
@@ -183,7 +185,8 @@ az snapshot create \
 
 RESOURCE_GROUP="packamal-rg"
 NAMESPACE="packamal"
-PVC_LIST=("postgres-pvc" "redis-pvc" "app-shared-pvc" "analysis-results-pvc")
+PVC_LIST=("postgres-pvc" "redis-celery-pvc" "app-shared-pvc" "analysis-results-pvc")
+# Note: redis-report-pvc is not backed up - redis-report uses ephemeral storage only
 
 for PVC_NAME in "${PVC_LIST[@]}"; do
   echo "Backing up $PVC_NAME..."

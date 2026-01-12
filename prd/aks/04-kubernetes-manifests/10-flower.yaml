@@ -30,15 +30,15 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              until nc -z redis 6379; do
-                echo "Waiting for Redis..."
+              until nc -z redis-celery 6379; do
+                echo "Waiting for Redis Celery..."
                 sleep 2
               done
               until nc -z database 5432; do
                 echo "Waiting for database..."
                 sleep 2
               done
-              echo "Redis and database are ready! Starting Flower..."
+              echo "Redis Celery and database are ready! Starting Flower..."
               # Unset FLOWER_PORT to avoid conflict with Kubernetes service discovery env var
               unset FLOWER_PORT
               exec celery -A packamal flower --port=5555

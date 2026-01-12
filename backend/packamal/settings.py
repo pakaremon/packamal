@@ -27,6 +27,17 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-1u3=v8*@$#ny04l7wdd4&
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DEBUG', 'False') == 'True'
 
+# EXECUTION_MODE: Determines how analysis tasks are executed and where results are read from
+# Options:
+#   - 'local': Local Docker execution, results from Docker volume (local development)
+#   - 'k8s': K8s execution, results from filesystem (K8s testing/staging)
+#   - 'production': K8s execution, results from filesystem (production)
+# Default: 'local' if DEBUG=True, 'production' if DEBUG=False
+EXECUTION_MODE = os.environ.get(
+    'EXECUTION_MODE',
+    'local' if DEBUG else 'production'
+).lower()
+
 ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
 
 # CSRF_TRUSTED_ORIGINS: Build from ALLOWED_HOSTS for common ports
@@ -185,11 +196,24 @@ YARA_RULES_REPO_URL = os.environ.get(
     'https://github.com/pakaremon/rust-mal/tree/master/web/package-analysis-web/package_analysis/src/yara/rules'
 )
 
-# Redis configuration for professional report storage
-REDIS_URL = os.environ.get('REDIS_URL', 'redis://redis:6379/0')
+# Redis configuration for caching (report storage and Django cache)
+# Default to 'redis://redis:6379/0' for docker-compose compatibility (single Redis instance)
+# In K8s/AKS, set REDIS_CACHE_URL to 'redis://redis-report:6379/0' (separate Redis for caching)
+REDIS_CACHE_URL = os.environ.get('REDIS_CACHE_URL', 'redis://redis:6379/0')
 PROFESSIONAL_REPORT_TTL_SECONDS = int(
     os.environ.get('PROFESSIONAL_REPORT_TTL_SECONDS', 24 * 60 * 60)
 )
+
+# Django cache configuration - use Redis to avoid consuming backend RAM
+# Separate Redis instance from Celery (redis-celery) to isolate cache from task queue
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'LOCATION': REDIS_CACHE_URL,
+        'KEY_PREFIX': 'django_cache',
+        'TIMEOUT': None,  # Keys don't expire by default
+    }
+}
 
 # Internal API token for worker-to-backend communication
 # This token is used by the Go analysis worker to authenticate callback requests

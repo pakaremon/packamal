@@ -5,6 +5,8 @@ metadata:
   namespace: packamal
 spec:
   replicas: 1
+  strategy:
+    type: Recreate  # Use Recreate instead of RollingUpdate for single-replica deployments with ReadWriteOnce PVC
   selector:
     matchLabels:
       app: database
@@ -13,6 +15,7 @@ spec:
       labels:
         app: database
     spec:
+      priorityClassName: packamal-high-priority
       containers:
         - name: postgres
           image: postgres:15-alpine
@@ -37,6 +40,13 @@ spec:
             # Use subdirectory to avoid lost+found directory issue on Azure disks
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: "100m"   # Database cần CPU ổn định nhưng không cần quá nhiều
+              memory: "256Mi"
+            limits:
+              cpu: "400m"
+              memory: "1Gi"
           volumeMounts:
             - name: postgres-data
               mountPath: /var/lib/postgresql/data
@@ -75,5 +85,4 @@ spec:
       port: 5432
       targetPort: 5432
   type: ClusterIP
-
 

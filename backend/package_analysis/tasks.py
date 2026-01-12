@@ -3,54 +3,205 @@ Celery tasks for package analysis.
 
 This module provides background task processing for dynamic package analysis.
 Tasks are executed via Celery workers with support for K8s job submission
-and direct execution modes. The system ensures only one container runs at
-a time and provides queue management, timeout handling, and result caching.
+and direct execution modes. The system provides queue management and timeout
+handling via K8s job monitoring.
 
 Migrated from QueueManager to use Celery for better scalability and monitoring.
+Timeout checking is handled by sync_k8s_job_status which monitors K8s job
+status and handles deadline exceeded conditions.
 """
 
 import logging
+import os
 import traceback
+import uuid
 from datetime import timedelta
 
 from celery import shared_task
 from celery.exceptions import Retry
 from django.conf import settings
-from django.core.cache import cache
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
-from .container_manager import container_manager
 from .helper import Helper
 from .models import AnalysisTask, ReportDynamicAnalysis
+from .celery_redis_client import get_celery_redis_client
+from .view_constants import (
+    STATUS_PROCESSING,
+    STATUS_COMPLETED,
+    STATUS_QUEUED,
+    STATUS_RECEIVED,
+    STATUS_FAILED,
+    STATUS_TIMEOUT,
+    ERROR_CATEGORY_RESULTS_NOT_FOUND,
+    ERROR_CATEGORY_TIMEOUT_ERROR,
+    ERROR_CATEGORY_K8S_JOB_FAILED,
+    ERROR_CATEGORY_K8S_JOB_NOT_FOUND,
+    ERROR_CATEGORY_QUEUE_ERROR,
+    K8S_CONDITION_TYPE_FAILED,
+    K8S_CONDITION_REASON_DEADLINE_EXCEEDED,
+    K8S_HTTP_NOT_FOUND,
+    CELERY_QUEUE_ANALYSIS,
+)
 
 logger = logging.getLogger(__name__)
 
 # Constants
-CACHE_TIMEOUT_DAYS = 7
-CACHE_TIMEOUT_SECONDS = CACHE_TIMEOUT_DAYS * 24 * 60 * 60
 RETRY_DELAY_SECONDS = 30
 RETRY_BACKOFF_BASE_SECONDS = 60
-CACHE_HIT_DURATION = 0.1
-TASK_CLEANUP_DAYS = 7
-CONTAINER_LOG_TAIL_LINES = 50
+MAX_CONCURRENT_JOBS = int(os.environ.get('MAX_CONCURRENT_JOBS', '1'))
+DEFAULT_TASK_PRIORITY = 0
+
+# Event-driven trigger lock (Redis)
+TRIGGER_LOCK_KEY = os.environ.get("ANALYSIS_TRIGGER_LOCK_KEY", "analysis:trigger_next_job_lock")
+TRIGGER_LOCK_TTL_SECONDS = int(os.environ.get("ANALYSIS_TRIGGER_LOCK_TTL_SECONDS", "120"))
 
 
-# Helper Functions
+def _new_lock_token() -> str:
+    return str(uuid.uuid4())
 
-def _create_mock_request():
+
+def _acquire_redis_lock(lock_key: str, token: str, ttl_seconds: int) -> bool:
+    client = get_celery_redis_client()
+    return bool(client.set(lock_key, token, nx=True, ex=ttl_seconds))
+
+
+def _release_redis_lock(lock_key: str, token: str) -> None:
     """
-    Creates a minimal request-like object for save_professional_report.
-    
-    Returns:
-        MockRequest: Object with build_absolute_uri method that constructs
-                     full URLs using BASE_URL setting.
+    Release lock only if still owned by this token.
+    Prevents accidentally deleting another worker's lock if TTL expired and got re-acquired.
     """
-    class MockRequest:
-        def build_absolute_uri(self, url):
-            base_url = getattr(settings, 'BASE_URL', 'http://localhost:8000')
-            return f"{base_url}{url}"
-    return MockRequest()
+    client = get_celery_redis_client()
+    lua = """
+    if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+    end
+    return 0
+    """
+    try:
+        client.eval(lua, 1, lock_key, token)
+    except Exception:
+        # Best-effort unlock; lock TTL guarantees eventual release.
+        logger.warning("Failed to release Redis lock (best-effort)", exc_info=True)
+
+
+def _count_active_k8s_jobs() -> int | None:
+    """
+    Count active/scheduled analysis jobs in K8s.
+    Returns None if K8s API fails (caller can decide fallback).
+    """
+    return _count_processing_k8s_jobs()
+
+
+def _find_oldest_queued_task_for_trigger() -> AnalysisTask | None:
+    """
+    Find the oldest task eligible for triggering.
+    Eligible statuses: queued/received/pending (legacy).
+    Must not already have job_id set.
+    """
+    return (
+        AnalysisTask.objects.filter(
+            status__in=[STATUS_QUEUED, STATUS_RECEIVED],
+        )
+        .filter(Q(job_id__isnull=True) | Q(job_id=''))
+        .order_by('created_at', 'id')
+        .first()
+    )
+
+
+def _reserve_task_for_processing(task_id: int) -> AnalysisTask | None:
+    """
+    Atomically reserve a queued task for processing.
+    Uses SELECT FOR UPDATE to prevent multiple triggers from reserving the same task.
+    """
+    with transaction.atomic():
+        task = (
+            AnalysisTask.objects.select_for_update()
+            .filter(id=task_id)
+            .first()
+        )
+        if not task:
+            return None
+
+        if task.status not in [STATUS_QUEUED, STATUS_RECEIVED]:
+            return None
+
+        if task.job_id:
+            return None
+
+        task.status = STATUS_PROCESSING
+        task.started_at = timezone.now()
+        task.save()
+        return task
+
+
+def _mark_task_submission_failed(task: AnalysisTask, error: Exception) -> None:
+    task.status = STATUS_FAILED
+    task.completed_at = timezone.now()
+    task.error_message = str(error)
+    task.error_category = ERROR_CATEGORY_QUEUE_ERROR
+    details = task.error_details or {}
+    details['k8s_submission_error'] = {
+        'message': str(error),
+        'type': error.__class__.__name__,
+        'at': timezone.now().isoformat(),
+    }
+    task.error_details = details
+    task.save()
+
+
+def trigger_next_analysis_if_slot_available() -> dict:
+    """
+    Shared event-driven trigger logic.
+    - Checks real active K8s jobs.
+    - If slot available, reserves the oldest queued task and submits it to K8s.
+    - Protected by a Redis lock to avoid duplicate job creation from concurrent callbacks.
+    """
+    if MAX_CONCURRENT_JOBS <= 0:
+        return {'triggered': False, 'reason': 'max_concurrent_jobs_disabled'}
+
+    lock_token = _new_lock_token()
+    if not _acquire_redis_lock(TRIGGER_LOCK_KEY, lock_token, TRIGGER_LOCK_TTL_SECONDS):
+        return {'triggered': False, 'reason': 'lock_not_acquired'}
+
+    try:
+        active_jobs = _count_active_k8s_jobs()
+        if active_jobs is None:
+            active_jobs = _count_processing_tasks_with_jobs()
+
+        if _is_limit_reached(active_jobs):
+            return {'triggered': False, 'reason': 'limit_reached', 'active_jobs': active_jobs}
+
+        candidate = _find_oldest_queued_task_for_trigger()
+        if not candidate:
+            return {'triggered': False, 'reason': 'no_queued_tasks'}
+
+        reserved = _reserve_task_for_processing(candidate.id)
+        if not reserved:
+            return {'triggered': False, 'reason': 'candidate_not_reservable'}
+
+        try:
+            from .services.k8s_service import K8sService
+            k8s_service = K8sService()
+            job_name = k8s_service.run_analysis(
+                ecosystem=reserved.ecosystem,
+                package_name=reserved.package_name,
+                task_id=reserved.id,
+                package_version=reserved.package_version or "latest",
+            )
+        except Exception as submission_error:
+            _mark_task_submission_failed(reserved, submission_error)
+            return {'triggered': False, 'reason': 'k8s_submission_failed', 'task_id': reserved.id}
+
+        with transaction.atomic():
+            task = AnalysisTask.objects.select_for_update().get(id=reserved.id)
+            task.job_id = job_name
+            task.save()
+
+        return {'triggered': True, 'task_id': reserved.id, 'job_id': job_name}
+    finally:
+        _release_redis_lock(TRIGGER_LOCK_KEY, lock_token)
 
 
 def _reuse_existing_result(task, exclude_task_id=None):
@@ -73,7 +224,7 @@ def _reuse_existing_result(task, exclude_task_id=None):
     
     query = AnalysisTask.objects.filter(
         purl=task.purl,
-        status='completed',
+        status= STATUS_COMPLETED,
         report__isnull=False
     )
     
@@ -94,109 +245,125 @@ def _mark_task_completed_from_existing(task, existing_task):
     Preconditions:
         existing_task must have status='completed' and a report
     """
-    task.status = 'completed'
+    task.status = STATUS_COMPLETED
     task.completed_at = timezone.now()
     task.report = existing_task.report
     task.download_url = existing_task.download_url
-    task.queue_position = None
     task.save()
 
 
-def _get_cache_key(task):
-    """
-    Generates cache key for analysis results.
-    
-    Parameters:
-        task: AnalysisTask instance
-    
-    Returns:
-        str: Cache key in format "analysis_{ecosystem}_{name}_{version}"
-    """
-    return (f"analysis_{task.ecosystem}_{task.package_name}_"
-            f"{task.package_version}")
+def _count_processing_tasks_with_jobs():
+    """Count processing tasks that have job_id set."""
+    return AnalysisTask.objects.filter(
+        status=STATUS_PROCESSING,
+        job_id__isnull=False
+    ).exclude(job_id='').count()
 
 
-def _save_task_results(task, results, duration=None):
+def _count_processing_k8s_jobs():
     """
-    Saves analysis results to database and generates professional report.
+    Count K8s jobs that are active or scheduled but not yet completed.
     
-    Parameters:
-        task: AnalysisTask instance to update
-        results: Dictionary containing analysis results
-        duration: Optional duration in seconds
+    Counts jobs that are either:
+    - Active (status.active > 0): jobs with running pods
+    - Scheduled but not completed (status.active = 0, succeeded = 0, failed = 0): 
+      jobs that have been created but pods haven't started yet (e.g., pending due to 
+      resource constraints), or jobs waiting to be processed.
+    
+    Excludes jobs that are completed (succeeded > 0) or have Complete condition,
+    even if other status fields are None or 0.
+    
+    This ensures we count all jobs that are consuming or will consume cluster resources,
+    not just jobs with active pods.
     
     Returns:
-        str: Download URL for professional report if successful, None otherwise
-    
+        int: Number of active/scheduled K8s jobs, or None if K8s API call fails
+        
     Errors:
-        Logs warning and returns None if professional report save fails
+        Logs warning and returns None if K8s API call fails
     """
-    from .views import save_report, save_professional_report
-    
-    save_report(results)
-    latest_report = ReportDynamicAnalysis.objects.latest('id')
-    
     try:
-        mock_request = _create_mock_request()
-        download_url, _ = save_professional_report(task, mock_request)
+        from .services.k8s_service import K8sService
         
-        with transaction.atomic():
-            task.refresh_from_db()
-            if task.status == 'running':
-                task.status = 'completed'
-                task.completed_at = timezone.now()
-                if duration is not None:
-                    task.duration_seconds = duration
-                task.report = latest_report
-                task.download_url = download_url
-                task.save()
+        k8s_service = K8sService()
+        jobs = k8s_service.list_jobs(label_selector='app=analysis-job')
         
-        return download_url
-    except Exception as save_error:
+        # Count jobs that are active OR scheduled but not completed
+        # Jobs are considered "scheduled" if they haven't completed (succeeded=0, failed=0)
+        # even if active=0 (waiting for resources, pending, etc.)
+        count = 0
+        for job in jobs.items:
+            if not job.status:
+                continue
+            
+            # Check conditions first - if job has Complete condition, it's done
+            if job.status.conditions:
+                is_complete = any(
+                    condition.type == "Complete" and condition.status == "True"
+                    for condition in job.status.conditions
+                )
+                if is_complete:
+                    # Job is completed, skip it
+                    continue
+            
+            active = getattr(job.status, 'active', None)
+            succeeded = getattr(job.status, 'succeeded', None)
+            failed = getattr(job.status, 'failed', None)
+            
+            # Convert None to 0 for comparison
+            active_val = active if active is not None else 0
+            succeeded_val = succeeded if succeeded is not None else 0
+            failed_val = failed if failed is not None else 0
+            
+            # Exclude jobs that have completed (succeeded > 0)
+            if succeeded_val > 0:
+                continue
+            
+            # Count if active > 0 OR if job is scheduled but not completed
+            if active_val > 0:
+                count += 1
+            elif succeeded_val == 0 and failed_val == 0:
+                # Job is scheduled but not completed (pending, waiting for resources, etc.)
+                count += 1
+        
+        logger.debug(f"Found {count} active/scheduled K8s jobs (active > 0 or pending, excluding completed)")
+        return count
+        
+    except Exception as e:
         logger.warning(
-            f"Failed to save professional report for task {task.id}: "
-            f"{save_error}"
+            f"Failed to count processing K8s jobs via API, will fallback to database check: {e}",
+            exc_info=True
         )
         return None
+
+
+def _is_limit_reached(current_count):
+    """Check if concurrent job limit is reached."""
+    return MAX_CONCURRENT_JOBS > 0 and current_count >= MAX_CONCURRENT_JOBS
 
 
 def _check_and_prepare_task(task_id, celery_task):
     """
     Checks if task can run and prepares it for execution.
     
+    Handles early exits (completed) and marks task as queued.
+    
     Parameters:
         task_id: ID of AnalysisTask to check
-        celery_task: Celery task instance for retry capability
+        celery_task: Celery task instance (unused, kept for compatibility)
     
     Returns:
         tuple: (task, early_return_dict)
                task: AnalysisTask instance if ready to run, None otherwise
                early_return_dict: Dict to return if task already completed,
                                  None otherwise
-    
-    Errors:
-        Raises celery retry exception if another task is running
     """
     with transaction.atomic():
         task = AnalysisTask.objects.select_for_update().get(id=task_id)
         
-        running_task = AnalysisTask.objects.filter(
-            status='running'
-        ).exclude(id=task_id).first()
-        
-        if running_task:
-            logger.info(
-                f"⏸️  Another task {running_task.id} is running. "
-                f"Retrying task {task_id} in {RETRY_DELAY_SECONDS}s..."
-            )
-            raise celery_task.retry(
-                countdown=RETRY_DELAY_SECONDS,
-                exc=Exception("Another task is running")
-            )
-        
-        if task.status == 'completed':
+        if task.status == STATUS_COMPLETED:
             logger.info(f"✅ Task {task_id} already completed, skipping")
-            return (None, False, {
+            return (None, {
                 'status': 'success',
                 'task_id': task_id,
                 'cached': True,
@@ -216,140 +383,50 @@ def _check_and_prepare_task(task_id, celery_task):
                 'message': 'Reused existing result'
             })
         
-        task.status = 'running'
-        task.started_at = timezone.now()
-        task.queue_position = None
-        task.last_heartbeat = timezone.now()
-        task.save()
+        if task.status == STATUS_PROCESSING and task.job_id:
+            return (None, {
+                'status': 'success',
+                'task_id': task_id,
+                'cached': False,
+                'message': 'Task already processing (job already submitted)',
+                'job_id': task.job_id,
+            })
+
+        if task.status in [STATUS_RECEIVED, STATUS_QUEUED]:
+            task.status = STATUS_QUEUED
+            task.save()
     
     return (task, None)
 
 
-def _handle_cached_result(task, cache_key):
-    """
-    Handles case where analysis result is found in cache.
-    
-    Parameters:
-        task: AnalysisTask instance
-        cache_key: Cache key string
-    
-    Returns:
-        dict: Success response dictionary
-    """
-    logger.info(
-        f"✅ Using cached result for {task.package_name}@"
-        f"{task.package_version}"
-    )
-    with transaction.atomic():
-        task.refresh_from_db()
-        task.status = 'completed'
-        task.completed_at = timezone.now()
-        task.duration_seconds = CACHE_HIT_DURATION
-        task.result = cache.get(cache_key)
-        task.save()
-    
-    return {
-        'status': 'success',
-        'task_id': task.id,
-        'cached': True
-    }
 
 
-def _handle_job_submission(task, job_id, task_id):
-    """
-    Handles K8s job submission case.
-    
-    Parameters:
-        task: AnalysisTask instance
-        job_id: K8s job ID string
-        task_id: Task ID for logging
-    
-    Returns:
-        dict: Submission response dictionary
-    """
-    with transaction.atomic():
-        task.refresh_from_db()
-        task.job_id = job_id
-        task.status = "submitted"
-        task.save()
-    
-    logger.info(f"✅ Task {task_id} submitted to K8s with job_id: {job_id}")
-    return {
-        'status': 'submitted',
-        'task_id': task_id,
-        'job_id': job_id,
-        'message': 'Analysis job submitted. Results will be available '
-                   'after completion.'
-    }
 
 
-def _handle_direct_execution_completion(task, results, start_time, cache_key):
-    """
-    Handles direct execution completion (DEBUG mode).
-    
-    Parameters:
-        task: AnalysisTask instance
-        results: Analysis results dictionary
-        start_time: Start time for duration calculation
-        cache_key: Cache key for storing results
-    
-    Returns:
-        dict: Success response dictionary
-    """
-    with transaction.atomic():
-        task.refresh_from_db()
-        if task.status == 'running':
-            task.last_heartbeat = timezone.now()
-            task.save()
-    
-    end_time = timezone.now()
-    duration = (end_time - start_time).total_seconds()
-    
-    cache.set(cache_key, results, timeout=CACHE_TIMEOUT_SECONDS)
-    download_url = _save_task_results(task, results, duration)
-    
-    logger.info(f"✅ Task {task.id} completed in {duration:.2f}s")
-    if download_url:
-        logger.info(f"   Download URL: {download_url}")
-    
-    return {
-        'status': 'success',
-        'task_id': task.id,
-        'duration': duration,
-        'cached': False
-    }
+def _extract_error_category(error):
+    """Extract error category from error object."""
+    if hasattr(error, 'error_details'):
+        return error.error_details.get('error_category', 'unknown_error')
+    return 'unknown_error'
+
+
+def _extract_error_details(error):
+    """Extract error details from error object."""
+    if hasattr(error, 'error_details'):
+        return error.error_details
+    return {}
 
 
 def _mark_task_failed(task_id, error):
-    """
-    Marks task as failed and saves error information.
-    
-    Parameters:
-        task_id: ID of AnalysisTask
-        error: Exception that caused failure
-    
-    Errors:
-        Logs error if saving failure state fails
-    """
+    """Marks task as failed and saves error information."""
     try:
         with transaction.atomic():
             task = AnalysisTask.objects.get(id=task_id)
-            task.status = 'failed'
+            task.status = STATUS_FAILED
             task.completed_at = timezone.now()
             task.error_message = str(error)
-            
-            error_category = 'unknown_error'
-            error_details = {}
-            if hasattr(error, 'error_details'):
-                error_details = error.error_details
-                error_category = error_details.get(
-                    'error_category',
-                    'unknown_error'
-                )
-            
-            task.error_category = error_category
-            task.error_details = error_details
-            task.queue_position = None
+            task.error_category = _extract_error_category(error)
+            task.error_details = _extract_error_details(error)
             task.save()
     except Exception as save_error:
         logger.error(f"Failed to save error state: {save_error}")
@@ -358,29 +435,11 @@ def _mark_task_failed(task_id, error):
 @shared_task(bind=True, max_retries=1, default_retry_delay=60)
 def run_dynamic_analysis(self, task_id):
     """
-    Background task for dynamic analysis with single-container execution.
-    
-    Ensures only one container runs at a time by checking for running tasks
-    before processing. If another task is running, this task will be retried.
-    Supports both K8s job submission (production) and direct execution
-    (DEBUG mode).
-    
-    Parameters:
-        self: Celery task instance (bind=True)
-        task_id: ID of AnalysisTask model instance
-    
-    Returns:
-        dict: Status dictionary with keys:
-            - status: 'success', 'submitted', or 'failed'
-            - task_id: Task ID
-            - cached: Boolean indicating if result was cached
-            - job_id: K8s job ID if submitted (optional)
-            - duration: Duration in seconds (optional)
-            - message: Status message (optional)
-    
-    Errors:
-        Raises Retry exception if another task is running
-        Raises exception if analysis fails permanently after max retries
+    Background task for dynamic analysis.
+
+    Event-driven model: this task no longer waits/retries on a fixed countdown.
+    It ensures the task is queued and then attempts to trigger the next available
+    analysis slot immediately via shared trigger logic.
     """
     logger.info(
         f"🚀 Worker {self.request.hostname} starting task {task_id}"
@@ -389,62 +448,15 @@ def run_dynamic_analysis(self, task_id):
     try:
         task, early_return = _check_and_prepare_task(task_id, self)
         if early_return:
-            _process_next_queued_task()
             return early_return
-        
-        logger.info(
-            f"📦 Analyzing {task.package_name}@{task.package_version} "
-            f"({task.ecosystem})"
-        )
-        
-        cache_key = _get_cache_key(task)
-        cached_result = cache.get(cache_key)
-        
-        if cached_result:
-            result = _handle_cached_result(task, cache_key)
-            _process_next_queued_task()
-            return result
-        
-        start_time = timezone.now()
-        
-        try:
-            # when runpackamal is called, it will return the job ID, not results
-            results = Helper.run_packaml(
-                package_name=task.package_name,
-                package_version=task.package_version,
-                ecosystem=task.ecosystem,
-                task_id=task_id # task ID analysis in database
-            )
-            
-            if isinstance(results, str):
-                result = _handle_job_submission(task, results, task_id)
-                _process_next_queued_task()
-                return result
-            
-            if isinstance(results, dict) and results.get("job_id"):
-                result = _handle_job_submission(
-                    task,
-                    results.get("job_id"),
-                    task_id
-                )
-                _process_next_queued_task()
-                return result
-            
-            # result = _handle_direct_execution_completion(
-            #     task,
-            #     results,
-            #     start_time,
-            #     cache_key
-            # )
-            _process_next_queued_task()
-            return None
-            
-        except Exception as analysis_error:
-            logger.error(
-                f"❌ Analysis failed for task {task_id}: "
-                f"{str(analysis_error)}"
-            )
-            raise
+
+        # Attempt to fill a slot immediately (FIFO).
+        trigger_result = trigger_next_analysis_if_slot_available()
+        return {
+            'status': 'success',
+            'task_id': task_id,
+            'trigger': trigger_result,
+        }
         
     except Retry:
         raise
@@ -453,7 +465,6 @@ def run_dynamic_analysis(self, task_id):
         logger.error(traceback.format_exc())
         
         _mark_task_failed(task_id, e)
-        _process_next_queued_task()
         
         if self.request.retries < self.max_retries:
             retry_countdown = (RETRY_BACKOFF_BASE_SECONDS *
@@ -471,395 +482,424 @@ def run_dynamic_analysis(self, task_id):
             raise
 
 
-def _process_next_queued_task():
-    """
-    Processes the next queued task in the analysis queue.
-    
-    Called after a task completes or fails to continue processing the queue.
-    Checks for existing completed results before queuing new tasks. Tasks are
-    selected by highest priority, then oldest queued_at time.
-    
-    Errors:
-        Logs error if processing fails but does not raise exception
-    """
-    try:
-        with transaction.atomic():
-            if AnalysisTask.objects.filter(status='running').exists():
-                return
-            
-            next_task = AnalysisTask.objects.filter(
-                status='queued'
-            ).order_by('-priority', 'queued_at').first()
-            
-            if not next_task:
-                return
-            
-            existing_task = _reuse_existing_result(
-                next_task,
-                exclude_task_id=next_task.id
-            )
-            if existing_task:
-                logger.info(
-                    f"Task {next_task.id} already has completed result, "
-                    f"marking as completed"
-                )
-                _mark_task_completed_from_existing(next_task, existing_task)
-                _update_queue_positions()
-                _process_next_queued_task()
-                return
-            
-            logger.info(f"📤 Queuing next task {next_task.id} via Celery")
-            run_dynamic_analysis.apply_async(
-                args=[next_task.id],
-                priority=next_task.priority,
-                queue='analysis'
-            )
-                
-    except Exception as e:
-        logger.error(f"Error processing next queued task: {e}")
+def _is_deadline_exceeded(condition):
+    """Check if condition indicates deadline exceeded."""
+    return (condition.type == K8S_CONDITION_TYPE_FAILED and 
+            condition.reason == K8S_CONDITION_REASON_DEADLINE_EXCEEDED)
 
 
-def _update_queue_positions():
-    """
-    Updates queue positions for all queued tasks.
-    
-    Assigns sequential position numbers based on priority (highest first)
-    and queued_at time (oldest first).
-    
-    Errors:
-        Logs error if update fails but does not raise exception
-    """
-    try:
-        with transaction.atomic():
-            queued_tasks = AnalysisTask.objects.filter(
-                status='queued'
-            ).order_by('-priority', 'queued_at')
-            
-            for index, task in enumerate(queued_tasks, 1):
-                task.queue_position = index
-                task.save()
-    except Exception as e:
-        logger.error(f"Error updating queue positions: {e}")
+def _has_deadline_exceeded_condition(job_status):
+    """Check if job status has deadline exceeded condition."""
+    if not job_status or not job_status.conditions:
+        return False
+    return any(_is_deadline_exceeded(c) for c in job_status.conditions)
 
 
-def _handle_timed_out_task(task):
-    """
-    Handles a single timed out task by stopping container and marking failed.
-    
-    Parameters:
-        task: AnalysisTask instance that has timed out
-    
-    Errors:
-        Logs warnings if container operations fail but continues processing
-    """
-    logger.warning(
-        f"⏰ Task {task.id} has timed out after "
-        f"{task.timeout_minutes} minutes"
-    )
-    
-    container_stopped = None
-    if task.container_id:
-        logger.info(
-            f"Stopping timed out container {task.container_id} "
-            f"for task {task.id}"
-        )
-        container_stopped = container_manager.stop_container(
-            task.container_id
-        )
-        
-        if container_stopped:
-            logger.info(
-                f"Successfully stopped container {task.container_id}"
-            )
-        else:
-            logger.warning(
-                f"Failed to stop container {task.container_id}"
-            )
-        
-        try:
-            logs = container_manager.get_container_logs(
-                task.container_id,
-                tail=CONTAINER_LOG_TAIL_LINES
-            )
-            logger.info(
-                f"Container {task.container_id} logs "
-                f"(last {CONTAINER_LOG_TAIL_LINES} lines):\n{logs}"
-            )
-        except Exception as log_error:
-            logger.warning(
-                f"Could not retrieve logs for container "
-                f"{task.container_id}: {log_error}"
-            )
-    
-    task.status = 'failed'
-    task.error_message = (
-        f"Task timed out after {task.timeout_minutes} minutes"
-    )
-    task.error_category = 'timeout_error'
-    task.error_details = {
-        'timeout_minutes': task.timeout_minutes,
-        'started_at': (
-            task.started_at.isoformat()
-            if task.started_at else None
-        ),
-        'timed_out_at': timezone.now().isoformat(),
-        'container_id': task.container_id,
-        'container_stopped': container_stopped
-    }
+def _mark_task_as_timeout(task, job_name):
+    """Mark task as timed out."""
+    task.status = STATUS_TIMEOUT
     task.completed_at = timezone.now()
-    task.queue_position = None
+    task.error_message = f"Job exceeded activeDeadlineSeconds ({task.timeout_minutes} minutes)"
+    task.error_category = ERROR_CATEGORY_TIMEOUT_ERROR
+    task.error_details = {
+        'reason': K8S_CONDITION_REASON_DEADLINE_EXCEEDED,
+        'job_name': job_name,
+        'timed_out_at': timezone.now().isoformat(),
+    }
     task.save()
 
 
-@shared_task
-def check_timeouts():
+def _mark_task_as_completed(task):
     """
-    Periodic task to check for timed out analysis tasks.
-    
-    Runs every 60 seconds via Celery Beat. Finds all running tasks that have
-    exceeded their timeout and marks them as failed. Stops associated
-    containers if they exist (legacy support).
-    
-    Returns:
-        dict: Dictionary with keys:
-            - timed_out_count: Number of tasks that timed out
-            - checked_at: ISO timestamp of check
-            - error: Error message if check failed (optional)
+    Mark task as completed.
+
+    NOTE: This should only be called after we have ensured results exist and have been
+    ingested into the database (ReportDynamicAnalysis + task.report). Otherwise we
+    can end up with "completed" tasks with missing reports when worker callbacks fail.
     """
-    try:
-        with transaction.atomic():
-            timed_out_tasks = [
-                task
-                for task in AnalysisTask.objects.filter(status='running')
-                if task.is_timed_out()
-            ]
-            
-            if not timed_out_tasks:
-                return {
-                    'timed_out_count': 0,
-                    'checked_at': timezone.now().isoformat()
-                }
-            
-            for task in timed_out_tasks:
-                _handle_timed_out_task(task)
-            
-            logger.info(
-                f"⏰ Handled {len(timed_out_tasks)} timed out tasks"
-            )
-            _process_next_queued_task()
-            
-            return {
-                'timed_out_count': len(timed_out_tasks),
-                'checked_at': timezone.now().isoformat()
-            }
-            
-    except Exception as e:
-        logger.error(f"Error checking timeouts: {e}")
-        return {'error': str(e)}
+    task.status = STATUS_COMPLETED
+    task.completed_at = timezone.now()
+    task.save()
 
 
-@shared_task
-def cleanup_old_tasks():
-    """
-    Periodic task to clean up old completed/failed tasks.
-    
-    Runs every hour via Celery Beat. Deletes tasks older than
-    TASK_CLEANUP_DAYS days that are in completed or failed status.
-    
-    Returns:
-        dict: Dictionary with keys:
-            - deleted_completed: Number of completed tasks deleted
-            - deleted_failed: Number of failed tasks deleted
-            - total: Total number of tasks deleted
-    """
-    cutoff_date = timezone.now() - timedelta(days=TASK_CLEANUP_DAYS)
-    
-    deleted_completed = AnalysisTask.objects.filter(
-        status='completed',
-        completed_at__lt=cutoff_date
-    ).delete()[0]
-    
-    deleted_failed = AnalysisTask.objects.filter(
-        status='failed',
-        completed_at__lt=cutoff_date
-    ).delete()[0]
-    
-    total_deleted = deleted_completed + deleted_failed
-    
-    logger.info(
-        f"🧹 Cleaned up {total_deleted} old tasks "
-        f"({deleted_completed} completed, {deleted_failed} failed)"
-    )
-    
-    return {
-        'deleted_completed': deleted_completed,
-        'deleted_failed': deleted_failed,
-        'total': total_deleted
+def _task_has_report(task: AnalysisTask) -> bool:
+    return bool(task.report_id)
+
+
+def _dynamic_result_key_for_task(task: AnalysisTask) -> str:
+    # Contract: task_id is always the deterministic key.
+    return str(task.id)
+
+
+def _load_dynamic_results(result_key: str):
+    from .services.result_storage_service import ResultStorageService
+
+    storage = ResultStorageService()
+    return storage.get_result_content(result_key)
+
+
+def _mark_task_failed_missing_results(task: AnalysisTask, result_key: str) -> None:
+    task.status = STATUS_FAILED
+    task.completed_at = timezone.now()
+    task.error_message = f"No results found for result_key={result_key}"
+    task.error_category = ERROR_CATEGORY_RESULTS_NOT_FOUND
+    details = task.error_details or {}
+    details["results_reconcile"] = {
+        "result_key": result_key,
+        "checked_at": timezone.now().isoformat(),
     }
+    task.error_details = details
+    task.save()
 
 
-@shared_task
-def reconcile_k8s_jobs():
-    """
-    Reconciliation loop to check K8s job status and fetch results.
-    
-    Runs every 5 minutes via Celery Beat. Checks status of submitted K8s
-    jobs, fetches results from Redis when jobs complete, and updates
-    AnalysisTask records accordingly.
-    
-    Returns:
-        dict: Dictionary with keys:
-            - checked: Number of tasks checked
-            - completed: Number of tasks that completed
-            - failed: Number of tasks that failed
-            - still_running: Number of tasks still running
-            - errors: Number of errors encountered
-            - error: Error message if reconciliation failed (optional)
-    """
-    pass
+def _attach_report_from_dynamic_results(task: AnalysisTask, results) -> None:
+    from .report_generator import Report
+    from .services.report_service import ReportService
+    from .services.report_artifact_storage_service import ReportArtifactStorageService
+
+    report_data = Report.generate_report(results)
+    payload = {
+        "packages": {
+            "package_name": task.package_name,
+            "package_version": task.package_version,
+            "ecosystem": task.ecosystem,
+        },
+        "report": report_data,
+    }
+    artifact_storage = ReportArtifactStorageService()
+    report_location = artifact_storage.save_report(task.id, payload)
+    report_obj = ReportService.save_report_to_database(payload, report_location=report_location)
+    task.report = report_obj
+    task.save()
 
 
-def _handle_succeeded_job(task, status_result, client, stats):
+def _reconcile_results_and_finalize_completion(task: AnalysisTask) -> None:
     """
-    Handles a successfully completed K8s job.
-    
-    Fetches results from Redis, saves reports, and marks task as completed.
-    
-    Parameters:
-        task: AnalysisTask instance
-        status_result: Dictionary with job status information
-        client: Analysis client for fetching results
-        stats: Dictionary to update with completion statistics
-    
-    Errors:
-        Increments stats['errors'] and logs warning if result fetch fails
+    Best-effort rescue path used by Celery beat when the Go worker callback didn't arrive.
+
+    Command-only: this function mutates task state (no return value).
     """
-    from .views import save_report
-    
+    if _task_has_report(task):
+        _mark_task_as_completed(task)
+        return
+
+    result_key = _dynamic_result_key_for_task(task)
+    results, result_location = _load_dynamic_results(result_key)
+    if not results:
+        _mark_task_failed_missing_results(task, result_key)
+        return
+
+    task.result_location = result_location
+    task.save()
+
+    _attach_report_from_dynamic_results(task, results)
+    _mark_task_as_completed(task)
+
+
+def _get_pod_logs_for_job(k8s_service, job_name):
+    """Retrieve pod logs for a job."""
     try:
-        result_data = client.get_job_result(task.job_id)
-        
-        if not result_data or not result_data.get("success"):
-            logger.warning(
-                f"No result data found for job {task.job_id}"
-            )
-            stats['errors'] += 1
-            return
-        
-        result = result_data.get("result", {})
-        report_data = result.get("report", {})
-        
-        with transaction.atomic():
-            task.refresh_from_db()
-            if task.status == 'submitted':
-                task.status = 'running'
-                task.started_at = (
-                    status_result.get("started_at") or task.created_at
-                )
-                task.save()
-        
-        save_report({
-            "packages": {
-                "package_name": task.package_name,
-                "package_version": task.package_version,
-                "ecosystem": task.ecosystem,
-            },
-            "report": report_data,
-        })
-        
-        latest_report = ReportDynamicAnalysis.objects.latest('id')
-        
-        duration = None
-        if (status_result.get("started_at") and
-                status_result.get("completed_at")):
-            duration = (
-                status_result["completed_at"] -
-                status_result["started_at"]
-            ).total_seconds()
-        
-        download_url = _save_task_results(task, {
-            "packages": {
-                "package_name": task.package_name,
-                "package_version": task.package_version,
-                "ecosystem": task.ecosystem,
-            },
-            "report": report_data,
-        }, duration)
-        
-        with transaction.atomic():
-            task.refresh_from_db()
-            if task.status == 'running':
-                task.status = 'completed'
-                task.completed_at = (
-                    status_result.get("completed_at") or timezone.now()
-                )
-                if (duration is not None and
-                        hasattr(task, 'duration_seconds')):
-                    task.duration_seconds = duration
-                task.report = latest_report
-                if download_url:
-                    task.download_url = download_url
-                task.save()
-        
-        logger.info(
-            f"✅ Task {task.id} (job {task.job_id}) completed successfully"
-        )
-        stats['completed'] += 1
-        
-    except Exception as fetch_error:
-        logger.error(
-            f"Failed to fetch result for job {task.job_id}: {fetch_error}"
-        )
-        stats['errors'] += 1
+        pods = k8s_service.list_pods_for_job(job_name)
+        if pods.items:
+            pod = pods.items[0]
+            return k8s_service.get_pod_logs(pod.metadata.name, tail_lines=200)
+    except Exception as log_error:
+        logger.warning(f"Could not retrieve logs for job {job_name}: {log_error}")
+    return None
 
 
-def _handle_failed_job(task, status_result, stats):
-    """
-    Handles a failed K8s job by marking task as failed.
-    
-    Parameters:
-        task: AnalysisTask instance
-        status_result: Dictionary with job status information
-        stats: Dictionary to update with failure statistics
-    """
+def _mark_task_as_failed(task, job_name, job_status, k8s_service):
+    """Mark task as failed with error details."""
+    task.status = STATUS_FAILED
+    task.completed_at = timezone.now()
+    task.error_message = "K8s job failed"
+    task.error_category = ERROR_CATEGORY_K8S_JOB_FAILED
+    task.error_details = {
+        'job_name': job_name,
+        'failed_count': job_status.failed,
+    }
+    logs = _get_pod_logs_for_job(k8s_service, job_name)
+    if logs:
+        task.error_details['pod_logs'] = logs
+    task.save()
+
+
+def _mark_task_as_job_not_found(task, job_name, api_error):
+    """Mark task as failed due to job not found."""
+    task.status = STATUS_FAILED
+    task.completed_at = timezone.now()
+    task.error_message = f"K8s job {job_name} not found"
+    task.error_category = ERROR_CATEGORY_K8S_JOB_NOT_FOUND
+    task.error_details = {
+        'job_name': job_name,
+        'error': str(api_error),
+    }
+    task.save()
+
+
+def _handle_timeout_task(task, job_name, k8s_service, stats):
+    """Handle task that timed out."""
+    logger.warning(f"Task {task.id} (job {job_name}) timed out due to activeDeadlineSeconds")
     with transaction.atomic():
         task.refresh_from_db()
-        if task.status == 'submitted':
-            task.status = 'failed'
-            task.completed_at = (
-                status_result.get("completed_at") or timezone.now()
-            )
-            task.error_message = status_result.get(
-                "error",
-                "Analysis job failed"
-            )
-            task.error_category = "k8s_job_failed"
-            task.save()
-    
-    logger.info(f"❌ Task {task.id} (job {task.job_id}) failed")
+        if task.status == STATUS_PROCESSING:
+            _mark_task_as_timeout(task, job_name)
+    stats['timeout'] += 1
+    _cleanup_completed_task(task, k8s_service)
+
+
+def _handle_completed_task(task, job_name, k8s_service, stats):
+    """Handle successfully completed task."""
+    logger.info(f"Task {task.id} (job {job_name}) completed successfully")
+    with transaction.atomic():
+        task.refresh_from_db()
+        if task.status == STATUS_PROCESSING:
+            _reconcile_results_and_finalize_completion(task)
+
+    # Count based on final state (avoid "completed without report" scenarios).
+    task.refresh_from_db()
+    if task.status == STATUS_COMPLETED and _task_has_report(task):
+        stats["completed"] += 1
+    else:
+        stats["failed"] += 1
+    _cleanup_completed_task(task, k8s_service)
+
+
+def _handle_failed_task(task, job_name, job_status, k8s_service, stats):
+    """Handle failed task (non-timeout)."""
+    logger.warning(f"Task {task.id} (job {job_name}) failed (not timeout)")
+    with transaction.atomic():
+        task.refresh_from_db()
+        if task.status == STATUS_PROCESSING:
+            _mark_task_as_failed(task, job_name, job_status, k8s_service)
+    stats['failed'] += 1
+    _cleanup_completed_task(task, k8s_service)
+
+
+def _handle_job_not_found(task, job_name, api_error, stats):
+    """Handle case where job is not found in K8s."""
+    logger.warning(f"Job {job_name} not found in K8s for task {task.id}. Marking as failed.")
+    with transaction.atomic():
+        task.refresh_from_db()
+        if task.status == STATUS_PROCESSING:
+            _mark_task_as_job_not_found(task, job_name, api_error)
     stats['failed'] += 1
 
 
-def _handle_running_job(task, status_result, stats):
+def _process_job_status(task, job_status, job_name, k8s_service, stats):
+    """Process job status and update task accordingly."""
+    # Check conditions first (they are more reliable indicators of job state)
+    if job_status and job_status.conditions:
+        # Check for completion conditions first
+        for condition in job_status.conditions:
+            if condition.type == "Complete" and condition.status == "True":
+                # Job is complete but succeeded count might not be updated yet
+                logger.info(f"Task {task.id} (job {job_name}) has Complete condition, treating as completed")
+                _handle_completed_task(task, job_name, k8s_service, stats)
+                return True
+        
+        # Check for deadline exceeded condition
+        if _has_deadline_exceeded_condition(job_status):
+            _handle_timeout_task(task, job_name, k8s_service, stats)
+            return True
+    
+    # Get status values, treating None as 0 (not initialized yet)
+    succeeded = getattr(job_status, 'succeeded', None) if job_status else None
+    failed = getattr(job_status, 'failed', None) if job_status else None
+    active = getattr(job_status, 'active', None) if job_status else None
+    
+    # Convert None to 0 for comparison, but track if all are None (unusual state)
+    succeeded_val = succeeded or 0
+    failed_val = failed or 0
+    active_val = active or 0
+    
+    # Log job status values for debugging (INFO level so it's always visible)
+    logger.info(
+        f"Task {task.id} (job {job_name}) status: "
+        f"succeeded={succeeded_val}, failed={failed_val}, active={active_val}"
+    )
+    
+    # If all status fields are None (unusual state), check if job has conditions
+    if job_status and (succeeded is None and failed is None and active is None):
+        # This is the "unusual status" case - if no conditions indicate completion,
+        # we should still treat it as processing, but log a warning
+        if not job_status.conditions:
+            logger.warning(
+                f"Job {job_name} for task {task.id} has unusual status (all fields None, no conditions). "
+                f"Treating as still processing, but this may indicate a K8s API issue."
+            )
+            stats['still_processing'] += 1
+            return True
+    
+    if succeeded_val > 0:
+        _handle_completed_task(task, job_name, k8s_service, stats)
+        return True
+    
+    if failed_val > 0:
+        if not _has_deadline_exceeded_condition(job_status):
+            _handle_failed_task(task, job_name, job_status, k8s_service, stats)
+            return True
+    
+    if active_val > 0:
+        stats['still_processing'] += 1
+        logger.debug(f"Task {task.id} (job {job_name}) still processing (active pods: {active_val})")
+        return True
+    
+    # All counters are 0/None - job may be in initial state or completed but not yet updated
+    stats['still_processing'] += 1
+    logger.debug(f"Task {task.id} (job {job_name}) has no active pods and no completion indicators, keeping as processing")
+    return True
+
+
+def _sync_single_task(task, k8s_service, stats):
+    """Sync status for a single task."""
+    from kubernetes.client.rest import ApiException
+    
+    stats['checked'] += 1
+    job_name = task.job_id
+    
+    try:
+        job = k8s_service.get_job(job_name)
+        if not job:
+            logger.warning(f"Job {job_name} not found in K8s for task {task.id}")
+            stats['errors'] += 1
+            return
+        
+        # Log detailed job info if status fields are all None (unusual state)
+        if job.status and (
+            getattr(job.status, 'succeeded', None) is None and
+            getattr(job.status, 'failed', None) is None and
+            getattr(job.status, 'active', None) is None
+        ):
+            logger.warning(
+                f"Job {job_name} for task {task.id} has unusual status: "
+                f"status object exists but all fields are None. "
+                f"Job metadata: creation_time={getattr(job.metadata, 'creation_timestamp', None)}"
+            )
+        
+        _process_job_status(task, job.status, job_name, k8s_service, stats)
+        
+    except ApiException as api_error:
+        if api_error.status == K8S_HTTP_NOT_FOUND:
+            _handle_job_not_found(task, job_name, api_error, stats)
+        else:
+            logger.error(f"K8s API error checking job {job_name} for task {task.id}: {api_error}")
+            stats['errors'] += 1
+    except Exception as e:
+        logger.error(f"Error checking job {job_name} for task {task.id}: {e}", exc_info=True)
+        stats['errors'] += 1
+
+
+@shared_task
+def maintenance_sync_k8s_status():
     """
-    Handles a running or pending K8s job by updating task status.
-    
-    Parameters:
-        task: AnalysisTask instance
-        status_result: Dictionary with job status information
-        stats: Dictionary to update with running statistics
+    Periodic safety net (Celery beat).
+    Only handles "missed" cases (e.g. job deleted unexpectedly, callback not received).
     """
-    if status_result.get("status") == "running":
-        with transaction.atomic():
-            task.refresh_from_db()
-            if task.status == 'submitted':
-                task.status = 'running'
-                if status_result.get("started_at"):
-                    task.started_at = status_result["started_at"]
-                task.save()
+    from .services.k8s_service import K8sService
     
-    stats['running'] += 1
+    stats = {
+        'checked': 0,
+        'completed': 0,
+        'failed': 0,
+        'timeout': 0,
+        'still_processing': 0,
+        'errors': 0,
+    }
     
+    try:
+        processing_tasks = AnalysisTask.objects.filter(
+            status=STATUS_PROCESSING,
+            job_id__isnull=False
+        ).exclude(job_id='')
+        
+        if not processing_tasks.exists():
+            logger.debug("No processing tasks to check")
+            return stats
+        
+        k8s_service = K8sService()
+        for task in processing_tasks:
+            _sync_single_task(task, k8s_service, stats)
+        
+        logger.info(
+            f"K8s job status sync completed: {stats['checked']} checked, "
+            f"{stats['completed']} completed, {stats['failed']} failed, "
+            f"{stats['timeout']} timeout, {stats['still_processing']} still processing"
+        )
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Error in maintenance_sync_k8s_status: {e}", exc_info=True)
+        stats['error'] = str(e)
+        return stats
+
+
+@shared_task
+def sync_k8s_job_status():
+    """
+    Backward-compatible alias.
+    Prefer `maintenance_sync_k8s_status`.
+    """
+    return maintenance_sync_k8s_status()
+
+
+@shared_task
+def check_and_trigger_next_analysis():
+    """Event-driven trigger entrypoint used by callbacks and maintenance tasks."""
+    return trigger_next_analysis_if_slot_available()
+
+
+def _save_pod_logs_to_task(task, k8s_service, job_name):
+    """Save pod logs to task error_details if not already present."""
+    if 'pod_logs' in task.error_details:
+        return
+    
+    try:
+        pods = k8s_service.list_pods_for_job(job_name)
+        if pods.items:
+            pod = pods.items[0]
+            logs = k8s_service.get_pod_logs(pod.metadata.name, tail_lines=500)
+            if not task.error_details:
+                task.error_details = {}
+            task.error_details['pod_logs'] = logs
+            task.save()
+    except Exception as log_error:
+        logger.warning(f"Could not retrieve logs for job {job_name} before cleanup: {log_error}")
+
+
+def _cleanup_completed_task(task, k8s_service):
+    """Cleanup K8s job for completed/failed/timeout tasks."""
+    if not task.job_id:
+        return
+    
+    job_name = task.job_id
+    
+    try:
+        if task.status in [STATUS_FAILED, STATUS_TIMEOUT]:
+            with transaction.atomic():
+                task.refresh_from_db()
+                _save_pod_logs_to_task(task, k8s_service, job_name)
+        
+        k8s_service.delete_job(job_name, propagation_policy="Background")
+        logger.info(f"Deleted K8s job {job_name} for task {task.id}")
+        
+    except Exception as cleanup_error:
+        logger.warning(f"Error during cleanup for task {task.id} (job {job_name}): {cleanup_error}")
+
+
+
+
+@shared_task
+def process_queued_tasks():
+    """
+    Legacy periodic job (Celery beat) kept as a fallback.
+    Instead of re-queueing every 30s, we now attempt a single event-driven trigger.
+    """
+    return {
+        'legacy': True,
+        'trigger': trigger_next_analysis_if_slot_available(),
+    }
 
 
 @shared_task

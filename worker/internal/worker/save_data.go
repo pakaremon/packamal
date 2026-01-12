@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path"
 	"time"
 
 	"github.com/ossf/package-analysis/internal/featureflags"
@@ -26,16 +27,28 @@ type ResultStores struct {
 	AnalyzedPackageSaved bool
 }
 
+const dynamicAnalysisReportFilename = "report.json"
+
 // SaveDynamicAnalysisData saves the data from dynamic analysis to the corresponding bucket in the ResultStores.
 // This includes strace data, execution log, and file writes (in that order).
 // If any operation fails, the rest are aborted
-func SaveDynamicAnalysisData(ctx context.Context, pkg *pkgmanager.Pkg, dest *ResultStores, data analysisrun.DynamicAnalysisData) error {
+func SaveDynamicAnalysisData(ctx context.Context, pkg *pkgmanager.Pkg, dest *ResultStores, data analysisrun.DynamicAnalysisData, taskID string) error {
 	if dest.DynamicAnalysis == nil {
 		// nothing to do
 		return nil
 	}
 
-	if err := dest.DynamicAnalysis.SaveDynamicAnalysis(ctx, pkg, data.StraceSummary, ""); err != nil {
+	// Deterministic key layout for dynamic analysis results:
+	//   <task_id>/report.json
+	//
+	// This makes PVC storage look like an object store today, and makes it
+	// trivial to migrate to Blob Storage later (provider swap only).
+	filename := ""
+	if taskID != "" {
+		filename = path.Join(taskID, dynamicAnalysisReportFilename)
+	}
+
+	if err := dest.DynamicAnalysis.SaveDynamicAnalysis(ctx, pkg, data.StraceSummary, filename); err != nil {
 		return fmt.Errorf("failed to save strace data to %s: %w", dest.DynamicAnalysis, err)
 	}
 	if err := saveExecutionLog(ctx, pkg, dest, data); err != nil {

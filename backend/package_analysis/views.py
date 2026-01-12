@@ -22,13 +22,17 @@ from .auth import require_api_key, require_internal_api_token
 from .services.report_service import ReportService, normalize_package_name_for_storage
 from .services.task_service import TaskService
 from .services.package_version_service import PackageVersionService
+from .services.result_storage_service import ResultStorageService
+from .services.report_artifact_storage_service import ReportArtifactStorageService
 from .view_constants import (
+    STATUS_RECEIVED,
     STATUS_QUEUED,
+    STATUS_PROCESSING,
     STATUS_COMPLETED,
-    STATUS_RUNNING,
     STATUS_FAILED,
-    STATUS_PENDING,
-    STATUS_SUBMITTED,
+    STATUS_TIMEOUT,
+    # Legacy status constants for backward compatibility
+
     HTTP_STATUS_BAD_REQUEST,
     HTTP_STATUS_NOT_FOUND,
     HTTP_STATUS_METHOD_NOT_ALLOWED,
@@ -37,8 +41,6 @@ from .view_constants import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
     DEFAULT_PAGE_NUMBER,
-    QUEUE_POSITION_RUNNING,
-    QUEUE_POSITION_NOT_IN_QUEUE,
     ERROR_CATEGORY_RESULTS_NOT_FOUND,
     ERROR_CATEGORY_QUEUE_ERROR,
     ERROR_CATEGORY_CALLBACK_ERROR,
@@ -55,7 +57,40 @@ logger = logging.getLogger(__name__)
 
 
 def download_professional_report(request, ecosystem, package_name, package_version):
-    """Serve professional report JSON directly from Redis by key."""
+    """
+    Serve professional report JSON from Redis (cache).
+
+    On-demand caching strategy:
+    - If Redis miss, check DB for an existing completed AnalysisTask with a report.
+    - If found, (re)generate the professional report into Redis and serve it.
+    - If not found, return 404.
+    """
+    report_blob = ReportService.get_report_from_redis(ecosystem, package_name, package_version)
+    if report_blob:
+        return HttpResponse(report_blob, content_type="application/json")
+
+    normalized_name = normalize_package_name_for_storage(package_name)
+    candidates = (
+        AnalysisTask.objects.filter(
+            status=STATUS_COMPLETED,
+            report__isnull=False,
+            package_version=package_version,
+            ecosystem__iexact=ecosystem,
+        )
+        .order_by("-completed_at", "-id")
+    )
+
+    completed_task = None
+    for t in candidates:
+        if normalize_package_name_for_storage(t.package_name) == normalized_name:
+            completed_task = t
+            break
+
+    if not completed_task:
+        return HttpResponseNotFound("Report not found")
+
+    # Populate Redis on-demand, then serve from Redis (single source of truth for this endpoint).
+    ReportService.save_professional_report(completed_task, request)
     report_blob = ReportService.get_report_from_redis(ecosystem, package_name, package_version)
     if not report_blob:
         return HttpResponseNotFound("Report not found or expired")
@@ -114,12 +149,16 @@ def _read_results_from_filesystem(package_name):
 
 
 def read_results_from_mount_path(package_name):
-    """Read analysis results based on environment (DEBUG vs production)."""
-    from django.conf import settings
+    """Read analysis results based on execution mode.
     
-    if settings.DEBUG:
-        return _read_results_from_docker_volume(package_name)
-    return _read_results_from_filesystem(package_name)
+    Uses ExecutionConfig to determine whether to read from Docker volume (local)
+    or filesystem (K8s/production).
+    """
+    from .config import ExecutionConfig
+    
+    if ExecutionConfig.should_use_filesystem_results():
+        return _read_results_from_filesystem(package_name)
+    return _read_results_from_docker_volume(package_name)
 
 def _extract_form_data(form):
     """Extract package information from validated form."""
@@ -158,35 +197,7 @@ def contact(request):
 def homepage(request):
     return render(request, 'package_analysis/homepage/homepage.html')
 
-def _build_timeout_info_for_task(task):
-    """Build timeout information dictionary for a single task."""
-    from .container_manager import container_manager
-    
-    remaining_time = task.get_remaining_time_minutes()
-    is_timed_out = task.is_timed_out()
-    
-    return {
-        'task_id': task.id,
-        'purl': task.purl,
-        'started_at': task.started_at.isoformat() if task.started_at else None,
-        'timeout_minutes': task.timeout_minutes,
-        'remaining_minutes': remaining_time,
-        'is_timed_out': is_timed_out,
-        'container_id': task.container_id,
-        'container_running': container_manager.is_container_running(task.container_id) if task.container_id else False
-    }
 
-
-def _build_timeout_status():
-    """Build timeout status for all running tasks."""
-    running_tasks = AnalysisTask.objects.filter(status=STATUS_RUNNING)
-    timeout_info = [_build_timeout_info_for_task(task) for task in running_tasks]
-    
-    return {
-        'running_tasks': len(running_tasks),
-        'timed_out_tasks': len([t for t in timeout_info if t['is_timed_out']]),
-        'tasks': timeout_info
-    }
 
 
 def _queue_celery_task(task):
@@ -201,16 +212,12 @@ def _queue_celery_task(task):
 
 def _create_and_queue_task(package_name, package_version, ecosystem):
     """Create analysis task and queue it."""
-    with transaction.atomic():
-        task = AnalysisTask.objects.create(
-            package_name=package_name,
-            package_version=package_version,
-            ecosystem=ecosystem,
-            status=STATUS_QUEUED,
-            queued_at=timezone.now()
-        )
-        task.queue_position = TaskService.calculate_queue_position(task)
-        task.save()
+    task = AnalysisTask.objects.create(
+        package_name=package_name,
+        package_version=package_version,
+        ecosystem=ecosystem,
+        status=STATUS_QUEUED
+    )
     _queue_celery_task(task)
     return task
 
@@ -548,12 +555,16 @@ def _parse_purl_request(request):
 
 def _build_completed_task_response(completed_task, request):
     """Build response for completed task."""
-    download_url, report_metadata = ReportService.save_professional_report(completed_task, request)
+    download_url = get_predicted_download_url(
+        request,
+        completed_task.package_name,
+        completed_task.package_version,
+        completed_task.ecosystem,
+    )
     return JsonResponse({
         'task_id': completed_task.id,
         'status': STATUS_COMPLETED,
         'result_url': download_url,
-        'report_metadata': report_metadata,
         'message': 'Analysis already exists (cached result)'
     })
 
@@ -562,14 +573,12 @@ def _build_active_task_response(active_task, package_name, package_version, ecos
     """Build response for active task."""
     predicted_download_url = get_predicted_download_url(request, package_name, package_version, ecosystem)
     status_url = request.build_absolute_uri(reverse('task_status_api', args=[active_task.id]))
-    queue_position = TaskService.get_queue_position_for_status(active_task)
     
     return json_success(request, {
         'task_id': active_task.id,
         'status': active_task.status,
         'status_url': status_url,
         'result_url': predicted_download_url,
-        'queue_position': queue_position,
         'message': f'Analysis already {active_task.status}'
     })
 
@@ -587,7 +596,7 @@ def _find_active_tasks_for_purl(purl):
     """Find active tasks for the given PURL."""
     return AnalysisTask.objects.filter(
         purl=purl,
-        status__in=[STATUS_RUNNING, STATUS_QUEUED, STATUS_PENDING],
+        status__in=[STATUS_PROCESSING, STATUS_QUEUED, STATUS_RECEIVED],
         created_at__gte=timezone.now() - timezone.timedelta(hours=ACTIVE_TASK_WINDOW_HOURS)
     ).order_by('-created_at')
 
@@ -618,32 +627,6 @@ def _extract_purl_data(request):
         )
 
 
-def _create_and_queue_new_task(api_key, purl, package_name, package_version, ecosystem, priority, request):
-    """Create new task and queue it via Celery."""
-    task = TaskService.create_task(api_key, purl, package_name, package_version, ecosystem, priority)
-    logger.info(f"Created new task {task.id} for PURL: {purl}")
-    
-    try:
-        TaskService.queue_task(task)
-        _queue_celery_task(task)
-        
-        status_url = request.build_absolute_uri(reverse('task_status_api', args=[task.id]))
-        predicted_download_url = get_predicted_download_url(request, package_name, package_version, ecosystem)
-        
-        return json_success(request, {
-            'task_id': task.id,
-            'status': STATUS_QUEUED,
-            'queue_position': task.queue_position,
-            'status_url': status_url,
-            'result_url': predicted_download_url,
-            'message': f'Analysis queued at position {task.queue_position}'
-        }, status=HTTP_STATUS_CREATED)
-    except Exception as e:
-        logger.error(f"Failed to queue analysis task {task.id}: {e}", exc_info=True)
-        TaskService.mark_task_as_failed(task, str(e), 'queue_error')
-        return json_error(
-            request, error='Failed to queue analysis', message=str(e), status=HTTP_STATUS_INTERNAL_SERVER_ERROR
-        )
 
 
 @csrf_exempt
@@ -683,46 +666,37 @@ def analyze_api(request):
         
         if completed_task:
             logger.debug(f"Found completed task {completed_task.id} for PURL: {purl}")
-            download_url, report_metadata = ReportService.save_professional_report(completed_task, request)
+            download_url = get_predicted_download_url(
+                request,
+                completed_task.package_name,
+                completed_task.package_version,
+                completed_task.ecosystem,
+            )
             return JsonResponse({
                 'task_id': completed_task.id,
                 'status': STATUS_COMPLETED,
                 'result_url': download_url,
-                'report_metadata': report_metadata,
-                'message': 'Analysis already exists (cached result)'
+                'message': 'Analysis already exists'
             })
         
         existing_active_tasks = AnalysisTask.objects.filter(
             purl=purl,
-            status__in=[STATUS_RUNNING, STATUS_QUEUED, STATUS_PENDING],
+            status__in=[STATUS_PROCESSING, STATUS_QUEUED, STATUS_RECEIVED],
             created_at__gte=timezone.now() - timezone.timedelta(hours=ACTIVE_TASK_WINDOW_HOURS)
         ).order_by('-created_at')
         
         active_task = existing_active_tasks.first()
         if active_task:
-            predicted_download_url = get_predicted_download_url(request, package_name, package_version, ecosystem)
-            status_url = request.build_absolute_uri(reverse('task_status_api', args=[active_task.id]))
-            queue_position = active_task.queue_position if active_task.status == STATUS_QUEUED else None
-
-            return json_success(request, {
-                'task_id': active_task.id,
-                'status': active_task.status,
-                'status_url': status_url,
-                'result_url': predicted_download_url,
-                'queue_position': queue_position,
-                'message': f'Analysis already {active_task.status}'
-            })
+            return _build_active_task_response(active_task, package_name, package_version, ecosystem, request)
         
         last_check = existing_active_tasks.filter(
             created_at__gte=timezone.now() - timezone.timedelta(minutes=RACE_CONDITION_CHECK_MINUTES)
         ).first()
         
         if last_check:
-            queue_position = last_check.queue_position if last_check.status == STATUS_QUEUED else None
             return json_success(request, {
                 'task_id': last_check.id,
                 'status': last_check.status,
-                'queue_position': queue_position,
                 'message': f'Analysis already {last_check.status} (race condition prevented)'
             })
         
@@ -734,27 +708,15 @@ def analyze_api(request):
             package_name=package_name,
             package_version=package_version,
             ecosystem=ecosystem,
-            status=STATUS_PENDING,
+            status=STATUS_RECEIVED,
             priority=priority,
         )
         
         logger.debug(f"Created new task {task.id} for PURL: {purl}")
         
         try:
-            from .tasks import run_dynamic_analysis
-            
-            with transaction.atomic():
-                task.status = STATUS_QUEUED
-                task.queued_at = timezone.now()
-                queued_count = AnalysisTask.objects.filter(status=STATUS_QUEUED).exclude(id=task.id).count()
-                task.queue_position = queued_count + 1
-                task.save()
-            
-            celery_task = run_dynamic_analysis.apply_async(
-                args=[task.id],
-                priority=task.priority,
-                queue=CELERY_QUEUE_ANALYSIS
-            )
+            TaskService.queue_task(task)
+            celery_task = _queue_celery_task(task)
             
             logger.info(f"Queued task {task.id} via Celery (Celery ID: {celery_task.id})")
             
@@ -764,10 +726,9 @@ def analyze_api(request):
             return json_success(request, {
                 'task_id': task.id,
                 'status': STATUS_QUEUED,
-                'queue_position': task.queue_position,
                 'status_url': status_url,
                 'result_url': predicted_download_url,
-                'message': f'Analysis queued at position {task.queue_position}'
+                'message': 'Analysis queued successfully'
             }, status=HTTP_STATUS_CREATED)
             
         except Exception as e:
@@ -803,8 +764,6 @@ def task_status_api(request, task_id):
             'package_version': task.package_version,
             'ecosystem': task.ecosystem,
             'priority': task.priority,
-            'queue_position': task.queue_position if task.status == STATUS_QUEUED else None,
-            'queued_at': task.queued_at.isoformat() if task.queued_at else None,
             'timeout_minutes': task.timeout_minutes,
             'container_id': task.container_id,
             'last_heartbeat': task.last_heartbeat.isoformat() if task.last_heartbeat else None
@@ -813,7 +772,7 @@ def task_status_api(request, task_id):
         if task.started_at:
             response_data['started_at'] = task.started_at.isoformat()
             
-            if task.status == STATUS_RUNNING:
+            if task.status == STATUS_PROCESSING:
                 remaining_time = task.get_remaining_time_minutes()
                 response_data['remaining_time_minutes'] = remaining_time
                 response_data['is_timed_out'] = task.is_timed_out()
@@ -910,8 +869,6 @@ def list_tasks_api(request):
             'package_version': t.package_version,
             'ecosystem': t.ecosystem,
             'priority': t.priority,
-            'queue_position': t.queue_position if t.status == STATUS_QUEUED else None,
-            'queued_at': t.queued_at.isoformat() if t.queued_at else None,
             'result_url': (request.build_absolute_uri(reverse('get_report', args=[t.report.id])) if t.report else None),
             'download_url': t.download_url,
             'error_message': t.error_message if t.error_message else None,
@@ -928,129 +885,66 @@ def list_tasks_api(request):
     })
 
 
-@csrf_exempt
-@api_handler
-def queue_status_api(request):
-    """
-    API endpoint to check the current queue status.
-    Shows all queued and running tasks across all API keys.
-    Now uses direct database queries instead of QueueManager.
-    """
-    if request.method != 'GET':
-        return json_error(request, error='Method not allowed', message='Only GET requests are supported', status=405)
-    
-    try:
-        from django.db import transaction
-        
-        with transaction.atomic():
-            queued_tasks = AnalysisTask.objects.filter(status=STATUS_QUEUED).order_by('queue_position')
-            running_tasks = AnalysisTask.objects.filter(status=STATUS_RUNNING)
-            
-            queue_status = {
-                'queue_length': queued_tasks.count(),
-                'running_tasks': running_tasks.count(),
-                'queued_tasks': [
-                    {
-                        'task_id': task.id,
-                        'purl': task.purl,
-                        'queue_position': task.queue_position,
-                        'priority': task.priority,
-                        'queued_at': task.queued_at.isoformat() if task.queued_at else None,
-                        'created_at': task.created_at.isoformat()
-                    }
-                    for task in queued_tasks
-                ],
-                'running_tasks': [
-                    {
-                        'task_id': task.id,
-                        'purl': task.purl,
-                        'started_at': task.started_at.isoformat() if task.started_at else None,
-                        'created_at': task.created_at.isoformat()
-                    }
-                    for task in running_tasks
-                ]
-            }
-        
-        return json_success(request, queue_status)
-    except Exception as e:
-        return json_error(request, error='Failed to get queue status', message=str(e), status=HTTP_STATUS_INTERNAL_SERVER_ERROR)
+def _extract_task_id_from_request(request):
+    """Extract task_id from request body (JSON or form data)."""
+    if request.content_type and 'application/json' in request.content_type:
+        try:
+            data = json.loads(request.body)
+            return data.get('task_id')
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return request.POST.get('task_id')
 
 
-@csrf_exempt
-@require_api_key
-@api_handler
-def task_queue_position_api(request, task_id):
-    """
-    API endpoint to check the queue position of a specific task.
-    Now uses direct database queries instead of QueueManager.
-    """
-    if request.method != 'GET':
-        return json_error(request, error='Method not allowed', message='Only GET requests are supported', status=405)
-    
-    try:
-        task = AnalysisTask.objects.get(id=task_id, api_key=request.api_key)
-        
-        if task.status == STATUS_QUEUED:
-            queue_position = task.queue_position
-        elif task.status == STATUS_RUNNING:
-            queue_position = QUEUE_POSITION_RUNNING
-        else:
-            queue_position = QUEUE_POSITION_NOT_IN_QUEUE
-        
-        return json_success(request, {
-            'task_id': task_id,
-            'status': task.status,
-            'queue_position': queue_position,
-            'purl': task.purl,
-            'package_name': task.package_name,
-            'package_version': task.package_version,
-            'ecosystem': task.ecosystem
-        })
-    except AnalysisTask.DoesNotExist:
-        return json_error(request, error='Task not found', message='Analysis task not found or access denied', status=404)
-    except Exception as e:
-        return json_error(request, error='Failed to get queue position', message=str(e), status=HTTP_STATUS_INTERNAL_SERVER_ERROR)
+def _process_analysis_results(task, results):
+    """Process analysis results and generate report."""
+    report_data = Report.generate_report(results)
+    report_payload = {
+        "packages": {
+            "package_name": task.package_name,
+            "package_version": task.package_version,
+            "ecosystem": task.ecosystem,
+        },
+        "report": report_data,
+    }
+    artifact_storage = ReportArtifactStorageService()
+    report_location = artifact_storage.save_report(task.id, report_payload)
+    ReportService.save_report_to_database(report_payload, report_location=report_location)
+    return ReportDynamicAnalysis.objects.latest('id')
 
 
-@csrf_exempt
-@api_handler
-def timeout_status_api(request):
-    """
-    API endpoint to check timeout status of running tasks.
-    Now uses direct database queries instead of QueueManager.
-    """
-    if request.method != 'GET':
-        return json_error(request, error='Method not allowed', message='Only GET requests are supported', status=405)
-    
-    try:
-        timeout_status = _build_timeout_status()
-        return json_success(request, timeout_status)
-    except Exception as e:
-        return json_error(request, error='Failed to get timeout status', message=str(e), status=HTTP_STATUS_INTERNAL_SERVER_ERROR)
+def _calculate_task_duration(task):
+    """Calculate task duration in seconds."""
+    if task.started_at:
+        return (timezone.now() - task.started_at).total_seconds()
+    return None
 
 
-@csrf_exempt
-@api_handler
-def check_timeouts_api(request):
-    """
-    API endpoint to manually trigger timeout check and cleanup.
-    Now triggers Celery task instead of QueueManager.
-    """
-    if request.method != 'POST':
-        return json_error(request, error='Method not allowed', message='Only POST requests are supported', status=HTTP_STATUS_METHOD_NOT_ALLOWED)
-    
-    try:
-        from .tasks import check_timeouts
-        result = check_timeouts.delay()
-        timeout_status = _build_timeout_status()
-        
-        return json_success(request, {
-            'message': 'Timeout check queued',
-            'celery_task_id': result.id,
-            'status': timeout_status
-        })
-    except Exception as e:
-        return json_error(request, error='Failed to check timeouts', message=str(e), status=HTTP_STATUS_INTERNAL_SERVER_ERROR)
+def _finalize_task_completion(task, latest_report, duration, download_url):
+    """Finalize task completion with all metadata."""
+    task.status = STATUS_COMPLETED
+    task.completed_at = timezone.now()
+    task.report = latest_report
+    if duration is not None and hasattr(task, 'duration_seconds'):
+        task.duration_seconds = duration
+    if download_url:
+        task.download_url = download_url
+    task.save()
+
+
+def _handle_missing_results(request, task, task_id):
+    """Handle case where results are not found."""
+    task.status = STATUS_FAILED
+    task.error_message = 'No results found in mount path'
+    task.error_category = ERROR_CATEGORY_RESULTS_NOT_FOUND
+    task.completed_at = timezone.now()
+    task.save()
+    return json_error(
+        request,
+        error='No results found',
+        message='Analysis results not found in mount path',
+        status=HTTP_STATUS_NOT_FOUND
+    )
 
 
 @csrf_exempt
@@ -1058,44 +952,52 @@ def check_timeouts_api(request):
 @api_handler
 def job_completed_api(request):
     """
-    API endpoint to notify that the Job is completed.
-    This API is called from post-processing heavy Go worker to notify that the Job is completed.
+    API endpoint called by Go worker when job completes.
+    
+    Processes results and marks task as completed. Handles race condition
+    where watcher may have already marked task as completed - still processes
+    results if report doesn't exist yet.
     
     When called, it:
-    1. Updates task status from 'running' to 'completed'
-    2. Reads analysis results from mount path
-    3. Generates and saves report to database
-    4. Creates professional report
-    5. Links everything to the task
+    1. Reads analysis results from mount path
+    2. Generates and saves report to database
+    3. Creates professional report
+    4. Updates task status from 'processing' to 'completed'
+    5. Triggers K8s job cleanup
     """
     if request.method != 'POST':
-        return json_error(request, error='Method not allowed', message='Only POST requests are supported', status=HTTP_STATUS_METHOD_NOT_ALLOWED)
+        return json_error(
+            request,
+            error='Method not allowed',
+            message='Only POST requests are supported',
+            status=HTTP_STATUS_METHOD_NOT_ALLOWED
+        )
 
-    # Get task_id from POST body (can be form data or JSON)
-    task_id = None
-    if request.content_type and 'application/json' in request.content_type:
-        try:
-            data = json.loads(request.body)
-            task_id = data.get('task_id')
-        except (json.JSONDecodeError, ValueError):
-            pass
-    
+    task_id = _extract_task_id_from_request(request)
     if not task_id:
-        task_id = request.POST.get('task_id')
-    
-    if not task_id:
-        return json_error(request, error='Missing task_id', message='task_id parameter is required', status=400)
+        return json_error(
+            request,
+            error='Missing task_id',
+            message='task_id parameter is required',
+            status=400
+        )
+
+    # Deterministic storage key (directory) for reading results.
+    # Contract: result_key == task_id, so the callback only needs task_id.
+    result_key = str(task_id)
     
     try:
-        from django.db import transaction
-        
         with transaction.atomic():
+            def _trigger_next_on_commit():
+                from .tasks import check_and_trigger_next_analysis
+                transaction.on_commit(lambda: check_and_trigger_next_analysis.delay())
+
             task = AnalysisTask.objects.select_for_update().get(id=task_id)
             
-            if task.status not in [STATUS_RUNNING, STATUS_SUBMITTED]:
+            if task.status not in [STATUS_PROCESSING, STATUS_COMPLETED]:
                 logger.warning(
-                    f"Task {task_id} is in status '{task.status}', not running or submitted. "
-                    f"Skipping status update."
+                    f"Task {task_id} is in status '{task.status}', "
+                    f"not processing or completed. Skipping."
                 )
                 return json_success(request, {
                     'message': f'Task already in status: {task.status}',
@@ -1103,78 +1005,78 @@ def job_completed_api(request):
                     'status': task.status
                 })
             
-            results = read_results_from_mount_path(task.package_name)
-            
+            if task.status == STATUS_COMPLETED and task.report:
+                logger.info(f"Task {task_id} already completed with report")
+                _trigger_next_on_commit()
+                predicted_download_url = get_predicted_download_url(
+                    request,
+                    task.package_name,
+                    task.package_version,
+                    task.ecosystem,
+                )
+                return json_success(request, {
+                    'message': 'Task already completed',
+                    'task_id': task_id,
+                    'status': STATUS_COMPLETED,
+                    'download_url': predicted_download_url
+                })
+
+            storage = ResultStorageService()
+            results, result_location = storage.get_result_content(result_key)
             if not results:
-                logger.error(f"No results found for task {task_id}")
-                task.status = STATUS_FAILED
-                task.error_message = 'No results found in mount path'
-                task.error_category = ERROR_CATEGORY_RESULTS_NOT_FOUND
-                task.completed_at = timezone.now()
-                task.save()
-                return json_error(request, error='No results found', message='Analysis results not found in mount path', status=HTTP_STATUS_NOT_FOUND)
+                logger.error(f"No results found for task {task_id} (result_key={result_key})")
+                return _handle_missing_results(request, task, task_id)
+
+            # Persist neutral storage pointer (path today, URL tomorrow).
+            task.result_location = result_location
+            task.save()
             
-            # Generate report from results
-            report_data = Report.generate_report(results)
+            latest_report = _process_analysis_results(task, results)
+            duration = _calculate_task_duration(task)
             
-            # Prepare report data in the format expected by save_report
-            report_payload = {
-                "packages": {
-                    "package_name": task.package_name,
-                    "package_version": task.package_version,
-                    "ecosystem": task.ecosystem,
-                },
-                "report": report_data,
-            }
-            
-            # Save report to database
-            ReportService.save_report_to_database(report_payload)
-            latest_report = ReportDynamicAnalysis.objects.latest('id')
-            
-            # Calculate duration if started_at is available
-            duration = None
-            if task.started_at:
-                duration = (timezone.now() - task.started_at).total_seconds()
-            
-            # First, link the report to the task temporarily so save_professional_report can access it
             task.report = latest_report
             task.save()
-            
-            # Create professional report and get download URL
-            try:
-                download_url, report_metadata = ReportService.save_professional_report(task, request)
-            except Exception as save_error:
-                logger.warning(
-                    f"Failed to save professional report for task {task_id}: {save_error}"
-                )
-                download_url = None
-            
-            task.status = STATUS_COMPLETED
-            task.completed_at = timezone.now()
-            if duration is not None and hasattr(task, 'duration_seconds'):
-                task.duration_seconds = duration
-            if download_url:
-                task.download_url = download_url
-            task.queue_position = QUEUE_POSITION_NOT_IN_QUEUE
-            task.save()
+
+            predicted_download_url = get_predicted_download_url(
+                request,
+                task.package_name,
+                task.package_version,
+                task.ecosystem,
+            )
+            _finalize_task_completion(task, latest_report, duration, predicted_download_url)
             
             logger.info(f"Task {task_id} completed successfully via worker callback")
+            
+            from .services.k8s_service import K8sService
+            from .tasks import _cleanup_completed_task
+            if task.job_id:
+                try:
+                    k8s_service = K8sService()
+                    _cleanup_completed_task(task, k8s_service)
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to cleanup K8s job for task {task_id}: {cleanup_error}")
+
+            _trigger_next_on_commit()
             
             return json_success(request, {
                 'message': 'Job completed successfully',
                 'task_id': task_id,
                 'status': STATUS_COMPLETED,
-                'download_url': download_url,
+                'download_url': predicted_download_url,
                 'report_id': latest_report.id
             })
             
     except AnalysisTask.DoesNotExist:
-        return json_error(request, error='Task not found', message=f'Analysis task {task_id} not found', status=404)
+        return json_error(
+            request,
+            error='Task not found',
+            message=f'Analysis task {task_id} not found',
+            status=404
+        )
     except Exception as e:
         logger.error(f"Error processing job completion for task {task_id}: {e}")
         logger.error(traceback.format_exc())
         
-        # Try to mark task as failed if it exists
         try:
             task = AnalysisTask.objects.get(id=task_id)
             task.status = STATUS_FAILED
@@ -1185,4 +1087,174 @@ def job_completed_api(request):
         except Exception:
             pass
         
-        return json_error(request, error='Internal server error', message=str(e), status=HTTP_STATUS_INTERNAL_SERVER_ERROR)
+        return json_error(
+            request,
+            error='Internal server error',
+            message=str(e),
+            status=HTTP_STATUS_INTERNAL_SERVER_ERROR
+        )
+
+
+@csrf_exempt
+@require_internal_api_token
+@api_handler
+def job_timeout_api(request):
+    """
+    Internal API endpoint called by the Go worker when analysis times out or fails.
+
+    Expected JSON payload:
+      {
+        "task_id": "<id>",
+        "status": "timeout" | "failed",
+        "reason": "<human readable reason>"
+      }
+    """
+    CALLBACK_KEY = 'worker_callback'
+    DEFAULT_TIMEOUT_REASON = 'Execution time exceeded'
+    ERROR_CATEGORY_TIMEOUT = 'timeout_error'
+    ERROR_CATEGORY_WORKER_FAILED = 'worker_failed'
+    ALLOWED_STATUSES = {'timeout', 'failed'}
+
+    def _parse_timeout_callback_payload(req):
+        if req.content_type and 'application/json' in req.content_type:
+            try:
+                payload = json.loads(req.body or b'{}')
+            except (json.JSONDecodeError, ValueError):
+                return None, json_error(
+                    req,
+                    error='Invalid JSON',
+                    message='Request body must be valid JSON',
+                    status=HTTP_STATUS_BAD_REQUEST
+                )
+        else:
+            payload = req.POST
+
+        raw_task_id = payload.get('task_id') or _extract_task_id_from_request(req)
+        raw_status = (payload.get('status') or '').strip().lower()
+        raw_reason = (payload.get('reason') or '').strip()
+
+        if not raw_task_id:
+            return None, json_error(
+                req,
+                error='Missing task_id',
+                message='task_id parameter is required',
+                status=HTTP_STATUS_BAD_REQUEST
+            )
+
+        try:
+            parsed_task_id = int(raw_task_id)
+        except (TypeError, ValueError):
+            return None, json_error(
+                req,
+                error='Invalid task_id',
+                message='task_id must be an integer',
+                status=HTTP_STATUS_BAD_REQUEST
+            )
+
+        if raw_status not in ALLOWED_STATUSES:
+            return None, json_error(
+                req,
+                error='Invalid status',
+                message="status must be 'timeout' or 'failed'",
+                status=HTTP_STATUS_BAD_REQUEST
+            )
+
+        if raw_status == 'timeout' and not raw_reason:
+            raw_reason = DEFAULT_TIMEOUT_REASON
+
+        return (parsed_task_id, raw_status, raw_reason), None
+
+    def _apply_task_failure(task, failure_status, failure_reason):
+        if failure_status == 'timeout':
+            task.status = STATUS_TIMEOUT
+            task.error_category = ERROR_CATEGORY_TIMEOUT
+        else:
+            task.status = STATUS_FAILED
+            task.error_category = ERROR_CATEGORY_WORKER_FAILED
+
+        task.error_message = failure_reason
+        task.completed_at = timezone.now()
+
+        details = task.error_details or {}
+        details[CALLBACK_KEY] = {
+            'status': failure_status,
+            'reason': failure_reason,
+            'received_at': timezone.now().isoformat(),
+        }
+        task.error_details = details
+        task.save()
+
+    def _cleanup_k8s_job(task, task_id_for_log):
+        if not task.job_id:
+            return
+        try:
+            from .services.k8s_service import K8sService
+            from .tasks import _cleanup_completed_task
+            k8s_service = K8sService()
+            _cleanup_completed_task(task, k8s_service)
+        except Exception as cleanup_error:
+            logger.warning(
+                f"Failed to cleanup K8s job for task {task_id_for_log}: {cleanup_error}"
+            )
+
+    if request.method != 'POST':
+        return json_error(
+            request,
+            error='Method not allowed',
+            message='Only POST requests are supported',
+            status=HTTP_STATUS_METHOD_NOT_ALLOWED
+        )
+
+    parsed, error_response = _parse_timeout_callback_payload(request)
+    if error_response:
+        return error_response
+
+    task_id, status, reason = parsed
+
+    try:
+        with transaction.atomic():
+            def _trigger_next_on_commit():
+                from .tasks import check_and_trigger_next_analysis
+                transaction.on_commit(lambda: check_and_trigger_next_analysis.delay())
+
+            task = AnalysisTask.objects.select_for_update().get(id=task_id)
+
+            # If task already finalized, don't overwrite.
+            if task.status in [STATUS_COMPLETED, STATUS_FAILED, STATUS_TIMEOUT]:
+                _trigger_next_on_commit()
+                return json_success(request, {
+                    'message': f'Task already finalized with status: {task.status}',
+                    'task_id': task_id,
+                    'status': task.status,
+                })
+
+            _apply_task_failure(task, status, reason)
+            _cleanup_k8s_job(task, task_id)
+            _trigger_next_on_commit()
+
+        logger.warning(
+            f"Task {task_id} marked as {status} via worker callback. Reason: {reason}"
+        )
+
+        return json_success(request, {
+            'message': 'Callback processed',
+            'task_id': task_id,
+            'status': task.status,
+        })
+
+    except AnalysisTask.DoesNotExist:
+        return json_error(
+            request,
+            error='Task not found',
+            message=f'Analysis task {task_id} not found',
+            status=HTTP_STATUS_NOT_FOUND
+        )
+    except Exception as e:
+        logger.error(f"Error processing worker timeout/failed callback for task {task_id}: {e}")
+        logger.error(traceback.format_exc())
+        return json_error(
+            request,
+            error='Internal server error',
+            message=str(e),
+            status=HTTP_STATUS_INTERNAL_SERVER_ERROR
+        )

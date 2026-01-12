@@ -15,10 +15,13 @@ spec:
     requests:
       storage: 20Gi  # Increased for production
 ---
+# Note: redis-report-pvc removed - redis-report uses ephemeral storage only
+# Redis report cache data is cleared on pod restart and uses maxmemory eviction
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: redis-pvc
+  name: redis-celery-pvc
   namespace: packamal
 spec:
   accessModes:
@@ -26,7 +29,7 @@ spec:
   storageClassName: managed-csi  # AKS default premium storage class
   resources:
     requests:
-      storage: 5Gi  # Increased for production
+      storage: 5Gi  # Redis for Celery broker and result backend
 ---
 # Shared storage for static files and media
 # Using Azure Files (azurefile-csi) for ReadWriteMany to allow multiple pods to mount

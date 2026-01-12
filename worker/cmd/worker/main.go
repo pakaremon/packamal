@@ -137,7 +137,8 @@ func handleMessage(ctx context.Context, msg *pubsub.Message, cfg *config, packag
 
 	result, dynamicAnalysisErr := worker.RunDynamicAnalysis(ctx, pkg, dynamicSandboxOpts, "")
 	if dynamicAnalysisErr == nil {
-		dynamicAnalysisErr = worker.SaveDynamicAnalysisData(ctx, pkg, cfg.resultStores, result.Data)
+		// Pub/Sub worker does not have a task_id concept; keep legacy behavior.
+		dynamicAnalysisErr = worker.SaveDynamicAnalysisData(ctx, pkg, cfg.resultStores, result.Data, "")
 	}
 
 	cfg.resultStores.AnalyzedPackageSaved = false

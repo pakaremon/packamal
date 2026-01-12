@@ -1,24 +1,110 @@
+# Redis for report caching
+# This Redis instance is ephemeral - data is cleared on restart
+# Uses maxmemory and eviction policy to automatically evict keys when memory limit is reached
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: redis
+  name: redis-report
   namespace: packamal
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: redis
+      app: redis-report
   template:
     metadata:
       labels:
-        app: redis
+        app: redis-report
     spec:
+      priorityClassName: packamal-high-priority
       containers:
         - name: redis
           image: redis:7-alpine
-          args: ["redis-server", "--appendonly", "yes"]
+          args:
+            - redis-server
+            - --maxmemory
+            - 900mb
+            - --maxmemory-policy
+            - allkeys-lru
+            # No appendonly - ephemeral cache, data cleared on restart
+            # allkeys-lru: evict least recently used keys when memory limit reached
           ports:
             - containerPort: 6379
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "1Gi"
+          # No volumeMounts - ephemeral storage only
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      # No volumes - ephemeral cache, data cleared on pod restart
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-report
+  namespace: packamal
+spec:
+  selector:
+    app: redis-report
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+  type: ClusterIP
+
+---
+# Redis for Celery worker (broker and result backend)
+# This Redis instance is persistent - data is preserved on restart
+# Uses appendonly to ensure task queue and results are not lost
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-celery
+  namespace: packamal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-celery
+  template:
+    metadata:
+      labels:
+        app: redis-celery
+    spec:
+      priorityClassName: packamal-high-priority
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            # Appendonly enabled - data persisted to disk
+            # appendfsync everysec: balance between performance and durability
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "512Mi"
           volumeMounts:
             - name: redis-data
               mountPath: /data
@@ -35,21 +121,19 @@ spec:
       volumes:
         - name: redis-data
           persistentVolumeClaim:
-            claimName: redis-pvc
+            claimName: redis-celery-pvc
 
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: redis
+  name: redis-celery
   namespace: packamal
 spec:
   selector:
-    app: redis
+    app: redis-celery
   ports:
     - name: redis
       port: 6379
       targetPort: 6379
   type: ClusterIP
-
-

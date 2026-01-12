@@ -11,6 +11,7 @@ from django.urls import reverse
 from ..models import AnalysisTask, Package, ReportDynamicAnalysis
 from ..redis_client import get_redis_client
 from ..view_constants import DEFAULT_TTL_HOURS, HOURS_IN_DAY, SECONDS_IN_MINUTE
+from .report_artifact_storage_service import ReportArtifactStorageService
 
 
 def normalize_package_name_for_storage(raw_name: str) -> str:
@@ -40,10 +41,16 @@ class ReportService:
 
     @staticmethod
     def extract_report_data_from_task(task: AnalysisTask) -> Dict[str, Any]:
-        """Extract report data from task's report field."""
+        """Extract report data from task (DB JSON or external artifact)."""
         report_data = task.report
-        if hasattr(report_data, 'report'):
-            return report_data.report
+        if hasattr(report_data, "report_location") and report_data.report_location:
+            return ReportArtifactStorageService().load_report(report_data.report_location)
+        if hasattr(report_data, "report"):
+            if isinstance(report_data.report, dict):
+                return report_data.report
+            # Future-proof: if report becomes a URL string, treat it as a location.
+            if isinstance(report_data.report, str) and report_data.report:
+                return ReportArtifactStorageService().load_report(report_data.report)
         return report_data
 
     @staticmethod
@@ -156,8 +163,8 @@ class ReportService:
         return redis_client.get(redis_key)
 
     @staticmethod
-    def save_report_to_database(report_data: Dict[str, Any]) -> ReportDynamicAnalysis:
-        """Save report to database."""
+    def save_report_to_database(report_data: Dict[str, Any], report_location: str | None = None) -> ReportDynamicAnalysis:
+        """Save report to database (and optionally persist external artifact location)."""
         package, _ = Package.objects.get_or_create(
             package_name=report_data['packages']['package_name'],
             package_version=report_data['packages']['package_version'],
@@ -165,7 +172,10 @@ class ReportService:
         )
         report, created = ReportDynamicAnalysis.objects.update_or_create(
             package=package,
-            defaults={'report': report_data}
+            defaults={
+                'report': report_data,
+                'report_location': report_location,
+            }
         )
         return report
 

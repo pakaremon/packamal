@@ -14,6 +14,7 @@ spec:
         app: celery-worker-2
     spec:
       serviceAccountName: backend-serviceaccount
+      priorityClassName: packamal-app-priority
       containers:
         - name: celery-worker-2
           # Reuses the backend image; runs the Celery worker for maintenance and celery queues.

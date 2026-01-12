@@ -14,6 +14,7 @@ spec:
         app: celery-worker
     spec:
       serviceAccountName: backend-serviceaccount
+      priorityClassName: packamal-app-priority
       containers:
         - name: celery-worker
           # Reuses the backend image; runs the Celery worker consuming Redis jobs.
@@ -33,13 +34,19 @@ spec:
                 echo "Waiting for database..."
                 sleep 0.5
               done
-              exec celery -A packamal worker -l info -n worker@%h -Q analysis --concurrency=1
+              exec celery -A packamal worker -l info -n worker@%h -Q analysis,maintenance --concurrency=1
+          volumeMounts:
+            - name: results-storage
+              mountPath: /data/results
           resources:
             requests:
-              cpu: 250m
-              memory: 512Mi
+              cpu: "100m"     # Giảm xuống để tiết kiệm CPU requests
+              memory: "384Mi" # Giảm memory request
             limits:
-              cpu: "2"
-              memory: 2Gi
-
+              cpu: "200m"     # Giảm limits để chừa chỗ cho 1 heavy job (2 CPU)
+              memory: "1Gi"   # Tăng lên để tránh OOM với concurrency=
+      volumes:
+        - name: results-storage
+          persistentVolumeClaim:
+            claimName: analysis-results-pvc
 

@@ -20,6 +20,13 @@ spec:
           imagePullPolicy: Always  # Use Always for production or specific tags
           ports:
             - containerPort: 80
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "256Mi"
           volumeMounts:
             - name: app-shared
               mountPath: /usr/share/nginx/html/static

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"time"
 
 	"gocloud.dev/blob"
@@ -221,6 +222,16 @@ func (rs *ResultStore) saveWithFilename(ctx context.Context, p Pkg, data any, fi
 
 	uploadPath := rs.generateKey(p, filename)
 	slog.InfoContext(ctx, "Uploading results", "bucket", rs.bucket.String(), "path", uploadPath)
+
+	// For file:// buckets, ensure the target directory exists before writing.
+	// This is important for deterministic keys like "<task_id>/report.json".
+	if rs.bucket.Scheme == "file" {
+		// rs.bucket.Path is the bucket root directory for fileblob.
+		dir := filepath.Join(rs.bucket.Path, filepath.FromSlash(path.Dir(uploadPath)))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
 
 	w, err := bkt.NewWriter(ctx, uploadPath, nil)
 	if err != nil {

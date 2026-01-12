@@ -1,197 +1,65 @@
-# AKS Setup and Deployment Guide
+#!/bin/bash
 
-This document provides step-by-step instructions for setting up and deploying the Packamal application on Azure Kubernetes Service (AKS).
+# Default: run all packages
+NUM_SAMPLES=""
+RANGE_START=""
+RANGE_END=""
 
-## Connect to AKS Cluster
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -n)
+            NUM_SAMPLES="$2"
+            # Check if it's a range (contains :)
+            if [[ "$NUM_SAMPLES" == *:* ]]; then
+                RANGE_START="${NUM_SAMPLES%%:*}"
+                RANGE_END="${NUM_SAMPLES##*:}"
+                
+                # Validate range format
+                if ! [[ "$RANGE_START" =~ ^[0-9]+$ ]] || ! [[ "$RANGE_END" =~ ^[0-9]+$ ]]; then
+                    echo "Error: Range must be in format 'start:end' where both are positive integers"
+                    echo "Usage: $0 [-n <number|start:end>]"
+                    echo "  -n <number>: Run only the first N packages"
+                    echo "  -n <start:end>: Run packages from index start to end (end is exclusive, like Python slicing)"
+                    exit 1
+                fi
+                
+                # Validate range values
+                if [ "$RANGE_START" -ge "$RANGE_END" ]; then
+                    echo "Error: Range start ($RANGE_START) must be less than end ($RANGE_END)"
+                    exit 1
+                fi
+                
+                NUM_SAMPLES=""  # Clear NUM_SAMPLES since we're using range
+            elif ! [[ "$NUM_SAMPLES" =~ ^[0-9]+$ ]]; then
+                echo "Error: -n requires a positive integer or range (start:end)"
+                echo "Usage: $0 [-n <number|start:end>]"
+                echo "  -n <number>: Run only the first N packages"
+                echo "  -n <start:end>: Run packages from index start to end (end is exclusive, like Python slicing)"
+                exit 1
+            fi
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: $0 [-n <number|start:end>]"
+            echo "  -n <number>: Run only the first N packages (default: all)"
+            echo "  -n <start:end>: Run packages from index start to end (end is exclusive, like Python slicing)"
+            echo "                 Example: -n 10:20 runs packages at indices 10-19"
+            echo "  -h, --help: Show this help message"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [-n <number|start:end>]"
+            echo "  -n <number>: Run only the first N packages"
+            echo "  -n <start:end>: Run packages from index start to end (end is exclusive, like Python slicing)"
+            exit 1
+            ;;
+    esac
+done
 
-```bash
-az aks get-credentials --resource-group packamal-rg --name packamal-aks
-```
-
-Expected output:
-```
-Merged "packamal-aks" as current context in /root/.kube/config
-```
-
-### Verify Cluster Connection
-
-```bash
-kubectl get nodes
-```
-
-Example output:
-```
-NAME                                STATUS   ROLES    AGE   VERSION
-aks-agentpool-38156302-vmss000000   Ready    <none>   18h   v1.33.5
-```
-
-```bash
-kubectl get services
-```
-
-Example output:
-```
-NAME         TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)   AGE
-kubernetes   ClusterIP   10.0.0.1     <none>        443/TCP   18h
-```
-
-## Create Azure Container Registry (ACR)
-
-### Register Required Providers
-
-Register the required Azure resource providers:
-
-```bash
-az provider register --namespace Microsoft.ContainerRegistry
-az provider register --namespace Microsoft.ContainerService
-az provider register --namespace Microsoft.Compute
-az provider register --namespace Microsoft.Network
-```
-
-Note: Registration may take a few minutes. You can monitor the status using:
-```bash
-az provider show -n Microsoft.ContainerRegistry
-```
-
-### Create ACR
-
-```bash
-az acr create --resource-group packamal-rg --name packamalacr --sku Basic
-```
-
-Example output (truncated):
-```json
-{
-  "loginServer": "packamalacr.azurecr.io",
-  "name": "packamalacr",
-  "provisioningState": "Succeeded",
-  "resourceGroup": "packamal-rg",
-  "sku": {
-    "name": "Basic",
-    "tier": "Basic"
-  }
-}
-```
-
-### Log in to ACR
-
-```bash
-az acr login --name packamalacr
-```
-
-Expected output:
-```
-Login Succeeded
-```
-
-### Verify ACR
-
-```bash
-az acr list \
-  --resource-group packamal-rg \
-  --query "[].{acrLoginServer:loginServer}" \
-  --output table
-```
-
-The registry for our setup is `packamalacr.azurecr.io`.
-
-## Build and Push Images
-
-```bash
-# Build images
-docker build -t packamal-backend:local /home/packamal/backend
-docker build -t packamal-frontend:local /home/packamal/frontend
-docker build -t packamal-go-worker-analysis:local -f /home/packamal/worker/cmd/analyze/Dockerfile /home/packamal/worker
-
-# Tag images for ACR
-docker tag packamal-backend:local packamalacr.azurecr.io/packamal-backend:latest
-docker tag packamal-frontend:local packamalacr.azurecr.io/packamal-frontend:latest
-docker tag packamal-go-worker-analysis:local packamalacr.azurecr.io/packamal-go-worker-analysis:latest
-
-# Push images to ACR
-docker push packamalacr.azurecr.io/packamal-backend:latest
-docker push packamalacr.azurecr.io/packamal-frontend:latest
-docker push packamalacr.azurecr.io/packamal-go-worker-analysis:latest
-```
-
-## Integrate ACR with AKS
-
-```bash
-az aks update -n packamal-aks -g packamal-rg --attach-acr packamalacr
-```
-
-**Command arguments explained:**
-- `-n packamal-aks`: (Short for `--name`) Specifies the name of the AKS cluster.
-- `-g packamal-rg`: (Short for `--resource-group`) Specifies the resource group where the cluster is located.
-- `--attach-acr packamalacr`: Establishes a connection between the AKS cluster and the Container Registry named `packamalacr`.
-
-This command grants the AKS cluster permissions to pull images from the ACR without requiring explicit authentication.
-
-## Deploy Application Resources
-
-### Create packamal namespace and deploy resources
-
-```bash
-bash prd/aks/apply-aks.sh
-```
-
-Or if you're already in the prd/aks directory:
-
-```bash
-./apply-aks.sh
-```
-
-## Access Services
-
-### Get Frontend Service External IP
-
-```bash
-kubectl get svc -n packamal frontend
-```
-
-### Create Superuser
-
-```bash
-kubectl exec -it -n packamal deployment/backend -- python manage.py createsuperuser
-```
-
-## Test API Endpoint
-
-Get the external IP from the frontend service and test the API:
-
-```bash
-# Example: Replace with your actual external IP
-curl -X POST "http://<EXTERNAL_IP>/api/v1/analyze/" \
-  -H "Authorization: Bearer <YOUR_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{"purl": "pkg:npm/react@18.2.0"}'
-```
-
-**Example:**
-```bash
-curl -X POST "http://4.242.184.148/api/v1/analyze/" \
-  -H "Authorization: Bearer PeqUje7L2fcXJ23wS9SjhmNyGVl1ZfMoYNMdFIfgIc6ovydUYFy64IXDrOFQ1zee" \
-  -H "Content-Type: application/json" \
-  -d '{"purl": "pkg:npm/lodash@4.17.20"}'
-```
-
-### monitore resources
-```sh
-  kubectl top pods -n packamal
-  kubectl describe resourcequota packamal-resource-quota -n packamal
-```
-### Batch Test Script
-
-Example script to test multiple packages:
-
-```sh
-./run_test.sh
-```
-
-# Replace with your actual external IP and token
-API_URL="http://20.171.173.185/api/v1/analyze/"
-TOKEN="bzjucGJb420b3Leh1NCz6BPqSswYueJu7jQjW3E1A2DnL77k67gT8oSkxUJz9WrC	"
-
+API_URL="http://4.249.47.62/api/v1/analyze/"
+TOKEN="n7wTepxaEInxBEOjlbXNdQccOPbJ4pFVC6WcsNLoOfIikXtS18MhkKuuuIUgvrHB"
 PACKAGES=(
   "pkg:npm/graphql@16.8.1"           # 96
   # 1–10
@@ -422,8 +290,42 @@ PACKAGES=(
   "pkg:npm/pnpm@8.10.5"               # 200
 )
 
+# Filter packages array if NUM_SAMPLES or range is specified
+if [ -n "$RANGE_START" ] && [ -n "$RANGE_END" ]; then
+    # Range mode: slice from start to end (end is exclusive, like Python)
+    RANGE_LENGTH=$((RANGE_END - RANGE_START))
+    TOTAL_COUNT="${#PACKAGES[@]}"
+    
+    # Validate range bounds
+    if [ "$RANGE_START" -ge "$TOTAL_COUNT" ]; then
+        echo "Error: Range start ($RANGE_START) is out of bounds (array has $TOTAL_COUNT packages)"
+        exit 1
+    fi
+    if [ "$RANGE_END" -gt "$TOTAL_COUNT" ]; then
+        echo "Warning: Range end ($RANGE_END) exceeds array size ($TOTAL_COUNT), using $TOTAL_COUNT instead"
+        RANGE_END="$TOTAL_COUNT"
+        RANGE_LENGTH=$((RANGE_END - RANGE_START))
+    fi
+    
+    PACKAGES=("${PACKAGES[@]:$RANGE_START:$RANGE_LENGTH}")
+    TOTAL_COUNT="${#PACKAGES[@]}"
+    echo "Running packages from index $RANGE_START to $((RANGE_END - 1)) ($TOTAL_COUNT package(s))..."
+    echo ""
+elif [ -n "$NUM_SAMPLES" ]; then
+    # Single number mode: first N packages
+    PACKAGES=("${PACKAGES[@]:0:$NUM_SAMPLES}")
+    TOTAL_COUNT="${#PACKAGES[@]}"
+    echo "Running first $TOTAL_COUNT package(s)..."
+    echo ""
+else
+    TOTAL_COUNT="${#PACKAGES[@]}"
+    echo "Running all $TOTAL_COUNT packages..."
+    echo ""
+fi
+
+COUNTER=1
 for PURL in "${PACKAGES[@]}"; do
-  echo "Analyzing $PURL"
+  echo "[$COUNTER/$TOTAL_COUNT] Analyzing $PURL"
 
   curl -s -X POST "$API_URL" \
     -H "Authorization: Bearer $TOKEN" \
@@ -431,44 +333,8 @@ for PURL in "${PACKAGES[@]}"; do
     -d "{\"purl\": \"$PURL\"}"
 
   echo -e "\n-----------------------------------"
+  COUNTER=$((COUNTER + 1))
 done
-```
 
-see the running pod
-```sh
-watch -n 0.01 "kubectl get pods -n packamal | grep Run"
-```
-
-**Note:** Replace `<EXTERNAL_IP>` and `<YOUR_TOKEN>` with your actual values before running the script.
-
-# Create node to run `heavy go worker`
-
-```sh
-az aks nodepool add \
-  --resource-group packamal-rg \
-  --cluster-name packamal-aks \
-  --name analysispool \
-  --node-count 1 \
-  --labels workload=heavy-analysis \
-  --node-taints workload=heavy-analysis:NoSchedule \
-  --node-vm-size Standard_D4s_v5 \
-  --no-wait
-```
-
-az aks nodepool add: Lệnh chính để thêm một nhóm node (máy ảo) mới vào cụm AKS.
-
---resource-group sbdemo01: Chỉ định nhóm tài nguyên Azure nơi cụm AKS của bạn đang tọa lạc.
-
---cluster-name sbdemo01: Tên của cụm AKS mà bạn muốn thêm node pool vào.
-
---name goworker: Tên định danh cho Node Pool mới này.
-
---node-count 1: Số lượng máy ảo (node) ban đầu sẽ được tạo trong pool này.
-
---node-taints isworker=yes:NoExecute:
-
-Taints là một cơ chế để hạn chế các Pod chạy trên node này.
-
-Cấu hình NoExecute có nghĩa là: Chỉ những Pod nào có Toleration tương ứng với foo=bar mới được phép chạy ở đây. Các Pod không có Toleration sẽ bị trục xuất (evicted) ngay lập tức.
-
---no-wait: Cho phép lệnh chạy dưới nền. Bạn sẽ nhận lại quyền điều khiển terminal ngay lập tức mà không cần đợi Azure hoàn tất việc tạo máy ảo.
+echo ""
+echo "Completed: $TOTAL_COUNT package(s) processed"

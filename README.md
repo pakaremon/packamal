@@ -31,6 +31,7 @@ Docker Compose-based development environment for Pack-A-Mal with separate servic
 2. [Local Testing with Kubernetes (Minikube)](#2-local-testing-with-kubernetes-minikube)
 3. [Production Deployment on Azure Kubernetes Service (AKS)](#3-production-deployment-on-azure-kubernetes-service-aks)
 4. [CI/CD with GitHub Actions](#4-cicd-with-github-actions)
+5. [Task Status API and Lifecycle](#5-task-status-api-and-lifecycle)
 
 ---
 
@@ -363,18 +364,167 @@ All components run in a single Kubernetes namespace `packamal`:
 
 ### Communication Flow
 
-1. Backend receives an API request and pushes a JSON job object into Redis. The Celery worker processes the job and sets the task status to "submitted" or "running".
+1. **Task Creation**: Backend receives an API request and creates an `AnalysisTask` with status `received`.
 
-2. The Celery worker creates a pod "go analysis worker" for dynamic analysis. See details in `backend/package_analysis/services/k8s_service.py`.
+2. **Queueing**: Task is pushed to Celery (Redis) and status changes to `queued`.
 
-3. The pod "go analysis worker" performs the analysis. After the analysis is completed:
-   - It saves the analysis result to permanent PVC storage called `"analysis-results-pvc"`
-   - It sends a signal to the internal API at `"http://backend:8000/api/v1/internal/callback/done/"` to notify the backend that the analysis task is completed
+3. **Job Submission**: Celery worker processes the job and:
+   - Calls `K8sService.run_analysis()` to create a Kubernetes Job
+   - On success, status changes to `processing` and `job_name` is stored
+   - See details in `backend/package_analysis/services/k8s_service.py`
 
-4. The backend, upon receiving the signal from "go analysis worker":
-   - Reads the analysis result from storage PVC `"analysis-results-pvc"`
-   - Saves the result to the database
-   - Updates the analysis task status to `DONE`
+4. **Analysis Execution**: The Kubernetes Job pod "go analysis worker" performs the analysis:
+   - Runs dynamic analysis in a sandboxed environment
+   - Saves the analysis result to permanent PVC storage `"analysis-results-pvc"`
+   - Sends a callback signal to `"http://backend:8000/api/v1/internal/callback/done/"` when completed
+
+5. **Completion Handling** (two paths):
+   - **Worker Callback Path**: Backend receives callback from worker:
+     - Reads analysis result from PVC storage
+     - Generates and saves report to database
+     - Creates professional report
+     - Updates task status to `completed`
+     - Triggers K8s job cleanup
+   - **Watcher Path**: `sync_k8s_job_status` task (runs every 60s):
+     - Monitors all tasks with status `processing`
+     - Queries K8s API for job status
+     - Updates status based on job conditions:
+       - `completed`: Job succeeded (`job_status.succeeded > 0`)
+       - `failed`: Job failed (non-timeout reasons)
+       - `timeout`: Job killed by K8s (`DeadlineExceeded` condition)
+     - Triggers cleanup for completed/failed/timeout tasks
+
+### Task Status Lifecycle
+
+The system uses the following status values for `AnalysisTask`:
+
+| Status | Description | Next Possible Statuses |
+|--------|-------------|------------------------|
+| `received` | Task mới tạo record trong DB | `queued` |
+| `queued` | Đã đẩy vào Celery (Redis) để chờ K8sService xử lý | `processing`, `failed` |
+| `processing` | Đã gọi API K8s thành công (Job đang chạy) | `completed`, `failed`, `timeout` |
+| `completed` | Worker báo về thành công hoặc Watcher thấy Job Succeeded | (final state) |
+| `failed` | Lỗi ứng dụng, lỗi code Go, hoặc K8s job failed | (final state) |
+| `timeout` | Bị K8s giết do chạy quá deadline (activeDeadlineSeconds) | (final state) |
+
+**Status Flow Diagram:**
+```
+received → queued → processing → completed
+                              ↘ failed
+                              ↘ timeout
+```
+
+### Status API Endpoints
+
+#### 1. Check Task Status
+```bash
+GET /api/v1/task/<task_id>/
+```
+Returns detailed task information including:
+- Current status
+- Queue position (if queued)
+- Remaining time (if processing)
+- Error details (if failed/timeout)
+- Download URL (if completed)
+
+**Example Response:**
+```json
+{
+  "task_id": 123,
+  "purl": "pkg:npm/lodash@4.17.21",
+  "status": "processing",
+  "package_name": "lodash",
+  "package_version": "4.17.21",
+  "ecosystem": "npm",
+  "created_at": "2024-01-15T10:00:00Z",
+  "started_at": "2024-01-15T10:00:05Z",
+  "remaining_time_minutes": 25,
+  "is_timed_out": false,
+  "job_id": "analysis-lodash-914f70e8"
+}
+```
+
+#### 2. List Tasks
+```bash
+GET /api/v1/reports/?page=1&page_size=20&status=processing
+```
+Query parameters:
+- `page`: Page number (default: 1)
+- `page_size`: Items per page (default: 20, max: 100)
+- `status`: Filter by status (`received`, `queued`, `processing`, `completed`, `failed`, `timeout`)
+
+#### 3. Queue Status
+```bash
+GET /api/v1/queue/status/
+```
+Returns current queue status:
+- Number of queued tasks
+- Number of processing tasks
+- List of queued tasks with positions
+- List of processing tasks with job IDs
+
+#### 4. Task Queue Position
+```bash
+GET /api/v1/task/<task_id>/queue/
+```
+Returns queue position for a specific task:
+- Queue position (if queued)
+- Status information
+- Package details
+
+#### 5. Timeout Status
+```bash
+GET /api/v1/timeout/status/
+```
+Returns timeout information for all processing tasks:
+- Number of running tasks
+- Number of timed out tasks
+- Detailed timeout info for each task
+
+#### 6. Internal Callback (Worker)
+```bash
+POST /api/v1/internal/callback/done/
+Authorization: Bearer <INTERNAL_API_TOKEN>
+Content-Type: application/json
+
+{
+  "task_id": "123"
+}
+```
+Called by Go worker when analysis completes. Requires internal API token.
+
+### Status Monitoring
+
+#### Automatic Monitoring
+- **Watcher Task**: `sync_k8s_job_status` runs every 60 seconds via Celery Beat
+  - Monitors all tasks with status `processing`
+  - Queries K8s API for job status
+  - Updates task status based on job conditions
+  - Triggers cleanup for completed tasks
+
+#### Manual Monitoring
+```bash
+# Check task status via API
+curl -X GET "http://localhost:8080/api/v1/task/123/" \
+  -H "Authorization: Bearer YOUR_API_TOKEN"
+
+# Check queue status
+curl -X GET "http://localhost:8080/api/v1/queue/status/" \
+  -H "Authorization: Bearer YOUR_API_TOKEN"
+
+# Check timeout status
+curl -X GET "http://localhost:8080/api/v1/timeout/status/"
+```
+
+### Cleanup Process
+
+When a task reaches a final state (`completed`, `failed`, or `timeout`):
+
+1. **Log Retrieval**: For `failed`/`timeout` tasks, pod logs are retrieved and saved to `error_details`
+2. **Job Deletion**: K8s job is deleted to free cluster resources
+3. **Cleanup Trigger**: Both watcher and worker callback trigger cleanup automatically
+
+Cleanup also runs periodically via `cleanup_old_tasks` task (every hour) to remove old completed/failed/timeout tasks and their associated K8s jobs.
 
 ### Additional Components
 
@@ -887,6 +1037,236 @@ kubectl rollout status deployment/backend -n packamal
 
 ---
 
+## 5. Task Status API and Lifecycle
+
+### Overview
+
+Pack-A-Mal uses a comprehensive task status system to track analysis jobs from creation to completion. The system supports both worker callbacks and automatic watcher monitoring to ensure reliable status updates.
+
+### Task Status Values
+
+| Status | Description | Next Possible Statuses |
+|--------|-------------|------------------------|
+| `received` | Task mới tạo record trong DB | `queued` |
+| `queued` | Đã đẩy vào Celery (Redis) để chờ K8sService xử lý | `processing`, `failed` |
+| `processing` | Đã gọi API K8s thành công (Job đang chạy) | `completed`, `failed`, `timeout` |
+| `completed` | Worker báo về thành công hoặc Watcher thấy Job Succeeded | (final state) |
+| `failed` | Lỗi ứng dụng, lỗi code Go, hoặc K8s job failed | (final state) |
+| `timeout` | Bị K8s giết do chạy quá deadline (activeDeadlineSeconds) | (final state) |
+
+### Status Flow
+
+```
+┌──────────┐
+│ received │  Task created in database
+└────┬─────┘
+     │
+     ▼
+┌──────────┐
+│  queued  │  Pushed to Celery broker (Redis)
+└────┬─────┘
+     │
+     ▼
+┌──────────────┐
+│  processing  │  K8s job created successfully
+└──────┬───────┘
+       │
+       ├──────────────┬──────────────┐
+       ▼              ▼              ▼
+┌─────────────┐ ┌──────────┐ ┌──────────┐
+│  completed  │ │  failed  │ │ timeout  │
+└─────────────┘ └──────────┘ └──────────┘
+```
+
+### Status API Endpoints
+
+#### 1. Check Task Status
+```bash
+GET /api/v1/task/<task_id>/
+Authorization: Bearer <API_TOKEN>
+```
+
+**Response:**
+```json
+{
+  "task_id": 123,
+  "purl": "pkg:npm/lodash@4.17.21",
+  "status": "processing",
+  "package_name": "lodash",
+  "package_version": "4.17.21",
+  "ecosystem": "npm",
+  "created_at": "2024-01-15T10:00:00Z",
+  "started_at": "2024-01-15T10:00:05Z",
+  "remaining_time_minutes": 25,
+  "is_timed_out": false,
+  "job_id": "analysis-lodash-914f70e8",
+  "queue_position": null,
+  "timeout_minutes": 30
+}
+```
+
+#### 2. List Tasks
+```bash
+GET /api/v1/reports/?page=1&page_size=20&status=processing
+Authorization: Bearer <API_TOKEN>
+```
+
+**Query Parameters:**
+- `page`: Page number (default: 1)
+- `page_size`: Items per page (default: 20, max: 100)
+- `status`: Filter by status (optional)
+
+**Response:**
+```json
+{
+  "items": [
+    {
+      "task_id": 123,
+      "purl": "pkg:npm/lodash@4.17.21",
+      "status": "processing",
+      "created_at": "2024-01-15T10:00:00Z",
+      "package_name": "lodash",
+      "package_version": "4.17.21",
+      "ecosystem": "npm"
+    }
+  ],
+  "page": 1,
+  "page_size": 20,
+  "total": 1
+}
+```
+
+#### 3. Queue Status
+```bash
+GET /api/v1/queue/status/
+```
+
+**Response:**
+```json
+{
+  "queue_length": 3,
+  "processing_tasks": 1,
+  "queued_tasks": [
+    {
+      "task_id": 120,
+      "purl": "pkg:pypi/requests@2.31.0",
+      "queue_position": 1,
+      "priority": 0,
+      "queued_at": "2024-01-15T10:00:00Z"
+    }
+  ],
+  "processing_tasks": [
+    {
+      "task_id": 123,
+      "purl": "pkg:npm/lodash@4.17.21",
+      "job_id": "analysis-lodash-914f70e8",
+      "started_at": "2024-01-15T10:00:05Z"
+    }
+  ]
+}
+```
+
+#### 4. Task Queue Position
+```bash
+GET /api/v1/task/<task_id>/queue/
+Authorization: Bearer <API_TOKEN>
+```
+
+#### 5. Timeout Status
+```bash
+GET /api/v1/timeout/status/
+```
+
+**Response:**
+```json
+{
+  "running_tasks": 1,
+  "timed_out_tasks": 0,
+  "tasks": [
+    {
+      "task_id": 123,
+      "purl": "pkg:npm/lodash@4.17.21",
+      "started_at": "2024-01-15T10:00:05Z",
+      "timeout_minutes": 30,
+      "remaining_minutes": 25,
+      "is_timed_out": false
+    }
+  ]
+}
+```
+
+### Status Monitoring
+
+#### Automatic Monitoring
+
+**Watcher Task** (`sync_k8s_job_status`):
+- Runs every 60 seconds via Celery Beat
+- Monitors all tasks with status `processing`
+- Queries K8s API for job status
+- Updates task status based on job conditions:
+  - `completed`: Job succeeded (`job_status.succeeded > 0`)
+  - `failed`: Job failed (non-timeout reasons)
+  - `timeout`: Job killed by K8s (`DeadlineExceeded` condition)
+- Triggers cleanup for completed/failed/timeout tasks
+
+**Worker Callback**:
+- Go worker calls `/api/v1/internal/callback/done/` when analysis completes
+- Backend processes results and marks task as `completed`
+- Handles race condition with watcher (if watcher marked as completed first, still processes results)
+
+#### Manual Monitoring
+
+```bash
+# Check specific task status
+curl -X GET "http://localhost:8080/api/v1/task/123/" \
+  -H "Authorization: Bearer YOUR_API_TOKEN"
+
+# Poll for completion
+while true; do
+  STATUS=$(curl -s -X GET "http://localhost:8080/api/v1/task/123/" \
+    -H "Authorization: Bearer YOUR_API_TOKEN" | jq -r '.status')
+  echo "Status: $STATUS"
+  if [ "$STATUS" = "completed" ] || [ "$STATUS" = "failed" ] || [ "$STATUS" = "timeout" ]; then
+    break
+  fi
+  sleep 5
+done
+```
+
+### Cleanup Process
+
+When a task reaches a final state (`completed`, `failed`, or `timeout`):
+
+1. **Log Retrieval**: For `failed`/`timeout` tasks, pod logs are retrieved and saved to `error_details`
+2. **Job Deletion**: K8s job is deleted to free cluster resources
+3. **Automatic Cleanup**: Both watcher and worker callback trigger cleanup automatically
+
+**Periodic Cleanup**:
+- `cleanup_old_tasks` task runs every hour
+- Removes old completed/failed/timeout tasks (older than 7 days)
+- Cleans up associated K8s jobs before deletion
+
+### Error Handling
+
+#### Failed Tasks
+- **Error Message**: Human-readable error description
+- **Error Category**: Categorized error type (e.g., `k8s_job_failed`, `timeout_error`, `results_not_found`)
+- **Error Details**: JSON object with detailed information including pod logs (if available)
+
+#### Timeout Tasks
+- Automatically detected when K8s job exceeds `activeDeadlineSeconds`
+- Error category: `timeout_error`
+- Error details include timeout reason and timestamp
+
+### Best Practices
+
+1. **Polling**: Poll task status every 5-10 seconds, not more frequently
+2. **Timeout Handling**: Check `is_timed_out` flag for processing tasks
+3. **Error Handling**: Always check `error_message` and `error_category` for failed tasks
+4. **Queue Position**: Use queue position to estimate wait time for queued tasks
+5. **Status URLs**: Use `status_url` from initial response for status checks
+
+---
 ## Support and Resources
 
 ### Project Documentation
