@@ -33,6 +33,9 @@ class ReportDynamicAnalysis(models.Model):
     package = models.OneToOneField(Package, on_delete=models.CASCADE, related_name='report_dynamic_analysis')
     # time = models.FloatField()
     report = models.JSONField(default=dict)  # Provide a default value
+    # Neutral pointer for report artifact (URL in Blob Storage in the future).
+    # Today this may be empty or a file:// URL if using local artifact storage.
+    report_location = models.TextField(blank=True, null=True, help_text="Location (path or URL) of the stored report artifact")
     
 
     def __str__(self):
@@ -89,6 +92,9 @@ class AnalysisTask(models.Model):
     error_details = models.JSONField(default=dict, blank=True, help_text="Detailed error information including stderr, stdout, etc.")
     report = models.OneToOneField(ReportDynamicAnalysis, on_delete=models.SET_NULL, null=True, blank=True)
     download_url = models.URLField(blank=True, null=True, help_text="URL to download the analysis report JSON file")
+    # Neutral storage pointer for results (PVC path today, Blob URL tomorrow).
+    # For dynamic analysis, this typically points to: <base>/<task_id>/report.json
+    result_location = models.TextField(blank=True, null=True, help_text="Location (path or URL) of the raw dynamic analysis result payload")
     
     priority = models.PositiveIntegerField(default=0, help_text="Priority level (higher number = higher priority)")
     

@@ -34,12 +34,19 @@ spec:
                 echo "Waiting for database..."
                 sleep 0.5
               done
-              exec celery -A packamal worker -l info -n worker@%h -Q analysis,maintenance --concurrency=4
+              exec celery -A packamal worker -l info -n worker@%h -Q analysis,maintenance --concurrency=1
+          volumeMounts:
+            - name: results-storage
+              mountPath: /data/results
           resources:
             requests:
               cpu: "100m"     # Giảm xuống để tiết kiệm CPU requests
               memory: "384Mi" # Giảm memory request
             limits:
-              cpu: "300m"     # Giảm limits để chừa chỗ cho 1 heavy job (2 CPU)
-              memory: "1Gi"   # Đủ để chạy ổn định các task quản lý
+              cpu: "200m"     # Giảm limits để chừa chỗ cho 1 heavy job (2 CPU)
+              memory: "1Gi"   # Tăng lên để tránh OOM với concurrency=
+      volumes:
+        - name: results-storage
+          persistentVolumeClaim:
+            claimName: analysis-results-pvc
 

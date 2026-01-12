@@ -58,8 +58,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-API_URL="http://4.249.38.72/api/v1/analyze/"
-TOKEN="i1yLTQ2V9wHPGsdBqb2AamvPxRx1ghX7K6yYUOhoKNHM7lKU69ae256tewDjfOeT"
+API_URL="http://4.249.47.62/api/v1/analyze/"
+TOKEN="n7wTepxaEInxBEOjlbXNdQccOPbJ4pFVC6WcsNLoOfIikXtS18MhkKuuuIUgvrHB"
 PACKAGES=(
   "pkg:npm/graphql@16.8.1"           # 96
   # 1–10

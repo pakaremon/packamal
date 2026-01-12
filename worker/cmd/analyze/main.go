@@ -135,7 +135,7 @@ func makeSandboxOptions() []sandbox.Option {
 	return sbOpts
 }
 
-func dynamicAnalysis(ctx context.Context, pkg *pkgmanager.Pkg, resultStores *worker.ResultStores) {
+func dynamicAnalysis(ctx context.Context, pkg *pkgmanager.Pkg, resultStores *worker.ResultStores, taskID string) {
 	if !*offline {
 		sandbox.InitNetwork(ctx)
 	}
@@ -159,7 +159,7 @@ func dynamicAnalysis(ctx context.Context, pkg *pkgmanager.Pkg, resultStores *wor
 			"status", string(result.LastStatus))
 	}
 
-	if err := worker.SaveDynamicAnalysisData(ctx, pkg, resultStores, result.Data); err != nil {
+	if err := worker.SaveDynamicAnalysisData(ctx, pkg, resultStores, result.Data, taskID); err != nil {
 		slog.ErrorContext(ctx, "Upload error", "error", err)
 	}
 }
@@ -321,7 +321,7 @@ func run() error {
 		// dynamicAnalysis() currently panics on error, so it's last
 		if runMode[analysis.Dynamic] {
 			slog.InfoContext(flowCtx, "Starting dynamic analysis")
-			dynamicAnalysis(flowCtx, pkg, &resultStores)
+			dynamicAnalysis(flowCtx, pkg, &resultStores, taskID)
 		}
 
 		doneCh <- nil

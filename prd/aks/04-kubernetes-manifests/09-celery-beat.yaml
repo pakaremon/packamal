@@ -37,6 +37,9 @@ spec:
                 sleep 0.5
               done
               exec celery -A packamal beat -l info
+          volumeMounts:
+            - name: results-storage
+              mountPath: /data/results
           resources:
             requests:
               cpu: "50m"      # 0.05 Core
@@ -44,4 +47,8 @@ spec:
             limits:
               cpu: "50m"      # 0.05 Core
               memory: "256Mi"
+      volumes:
+        - name: results-storage
+          persistentVolumeClaim:
+            claimName: analysis-results-pvc
 

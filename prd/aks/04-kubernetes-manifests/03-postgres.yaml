@@ -45,8 +45,8 @@ spec:
               cpu: "100m"   # Database cần CPU ổn định nhưng không cần quá nhiều
               memory: "256Mi"
             limits:
-              cpu: "700m"
-              memory: "2Gi"
+              cpu: "400m"
+              memory: "1Gi"
           volumeMounts:
             - name: postgres-data
               mountPath: /var/lib/postgresql/data

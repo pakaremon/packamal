@@ -22,6 +22,8 @@ from .auth import require_api_key, require_internal_api_token
 from .services.report_service import ReportService, normalize_package_name_for_storage
 from .services.task_service import TaskService
 from .services.package_version_service import PackageVersionService
+from .services.result_storage_service import ResultStorageService
+from .services.report_artifact_storage_service import ReportArtifactStorageService
 from .view_constants import (
     STATUS_RECEIVED,
     STATUS_QUEUED,
@@ -30,9 +32,7 @@ from .view_constants import (
     STATUS_FAILED,
     STATUS_TIMEOUT,
     # Legacy status constants for backward compatibility
-    STATUS_RUNNING,
-    STATUS_PENDING,
-    STATUS_SUBMITTED,
+
     HTTP_STATUS_BAD_REQUEST,
     HTTP_STATUS_NOT_FOUND,
     HTTP_STATUS_METHOD_NOT_ALLOWED,
@@ -57,7 +57,40 @@ logger = logging.getLogger(__name__)
 
 
 def download_professional_report(request, ecosystem, package_name, package_version):
-    """Serve professional report JSON directly from Redis by key."""
+    """
+    Serve professional report JSON from Redis (cache).
+
+    On-demand caching strategy:
+    - If Redis miss, check DB for an existing completed AnalysisTask with a report.
+    - If found, (re)generate the professional report into Redis and serve it.
+    - If not found, return 404.
+    """
+    report_blob = ReportService.get_report_from_redis(ecosystem, package_name, package_version)
+    if report_blob:
+        return HttpResponse(report_blob, content_type="application/json")
+
+    normalized_name = normalize_package_name_for_storage(package_name)
+    candidates = (
+        AnalysisTask.objects.filter(
+            status=STATUS_COMPLETED,
+            report__isnull=False,
+            package_version=package_version,
+            ecosystem__iexact=ecosystem,
+        )
+        .order_by("-completed_at", "-id")
+    )
+
+    completed_task = None
+    for t in candidates:
+        if normalize_package_name_for_storage(t.package_name) == normalized_name:
+            completed_task = t
+            break
+
+    if not completed_task:
+        return HttpResponseNotFound("Report not found")
+
+    # Populate Redis on-demand, then serve from Redis (single source of truth for this endpoint).
+    ReportService.save_professional_report(completed_task, request)
     report_blob = ReportService.get_report_from_redis(ecosystem, package_name, package_version)
     if not report_blob:
         return HttpResponseNotFound("Report not found or expired")
@@ -522,12 +555,16 @@ def _parse_purl_request(request):
 
 def _build_completed_task_response(completed_task, request):
     """Build response for completed task."""
-    download_url, report_metadata = ReportService.save_professional_report(completed_task, request)
+    download_url = get_predicted_download_url(
+        request,
+        completed_task.package_name,
+        completed_task.package_version,
+        completed_task.ecosystem,
+    )
     return JsonResponse({
         'task_id': completed_task.id,
         'status': STATUS_COMPLETED,
         'result_url': download_url,
-        'report_metadata': report_metadata,
         'message': 'Analysis already exists (cached result)'
     })
 
@@ -629,13 +666,17 @@ def analyze_api(request):
         
         if completed_task:
             logger.debug(f"Found completed task {completed_task.id} for PURL: {purl}")
-            download_url, report_metadata = ReportService.save_professional_report(completed_task, request)
+            download_url = get_predicted_download_url(
+                request,
+                completed_task.package_name,
+                completed_task.package_version,
+                completed_task.ecosystem,
+            )
             return JsonResponse({
                 'task_id': completed_task.id,
                 'status': STATUS_COMPLETED,
                 'result_url': download_url,
-                'report_metadata': report_metadata,
-                'message': 'Analysis already exists (cached result)'
+                'message': 'Analysis already exists'
             })
         
         existing_active_tasks = AnalysisTask.objects.filter(
@@ -866,7 +907,9 @@ def _process_analysis_results(task, results):
         },
         "report": report_data,
     }
-    ReportService.save_report_to_database(report_payload)
+    artifact_storage = ReportArtifactStorageService()
+    report_location = artifact_storage.save_report(task.id, report_payload)
+    ReportService.save_report_to_database(report_payload, report_location=report_location)
     return ReportDynamicAnalysis.objects.latest('id')
 
 
@@ -938,6 +981,10 @@ def job_completed_api(request):
             message='task_id parameter is required',
             status=400
         )
+
+    # Deterministic storage key (directory) for reading results.
+    # Contract: result_key == task_id, so the callback only needs task_id.
+    result_key = str(task_id)
     
     try:
         with transaction.atomic():
@@ -961,31 +1008,42 @@ def job_completed_api(request):
             if task.status == STATUS_COMPLETED and task.report:
                 logger.info(f"Task {task_id} already completed with report")
                 _trigger_next_on_commit()
+                predicted_download_url = get_predicted_download_url(
+                    request,
+                    task.package_name,
+                    task.package_version,
+                    task.ecosystem,
+                )
                 return json_success(request, {
                     'message': 'Task already completed',
                     'task_id': task_id,
                     'status': STATUS_COMPLETED,
-                    'download_url': task.download_url
+                    'download_url': predicted_download_url
                 })
-            
-            results = read_results_from_mount_path(task.package_name)
+
+            storage = ResultStorageService()
+            results, result_location = storage.get_result_content(result_key)
             if not results:
-                logger.error(f"No results found for task {task_id}")
+                logger.error(f"No results found for task {task_id} (result_key={result_key})")
                 return _handle_missing_results(request, task, task_id)
+
+            # Persist neutral storage pointer (path today, URL tomorrow).
+            task.result_location = result_location
+            task.save()
             
             latest_report = _process_analysis_results(task, results)
             duration = _calculate_task_duration(task)
             
             task.report = latest_report
             task.save()
-            
-            try:
-                download_url, report_metadata = ReportService.save_professional_report(task, request)
-            except Exception as save_error:
-                logger.warning(f"Failed to save professional report for task {task_id}: {save_error}")
-                download_url = None
-            
-            _finalize_task_completion(task, latest_report, duration, download_url)
+
+            predicted_download_url = get_predicted_download_url(
+                request,
+                task.package_name,
+                task.package_version,
+                task.ecosystem,
+            )
+            _finalize_task_completion(task, latest_report, duration, predicted_download_url)
             
             logger.info(f"Task {task_id} completed successfully via worker callback")
             
@@ -1004,7 +1062,7 @@ def job_completed_api(request):
                 'message': 'Job completed successfully',
                 'task_id': task_id,
                 'status': STATUS_COMPLETED,
-                'download_url': download_url,
+                'download_url': predicted_download_url,
                 'report_id': latest_report.id
             })
             

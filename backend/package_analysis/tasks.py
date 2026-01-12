@@ -34,6 +34,7 @@ from .view_constants import (
     STATUS_RECEIVED,
     STATUS_FAILED,
     STATUS_TIMEOUT,
+    ERROR_CATEGORY_RESULTS_NOT_FOUND,
     ERROR_CATEGORY_TIMEOUT_ERROR,
     ERROR_CATEGORY_K8S_JOB_FAILED,
     ERROR_CATEGORY_K8S_JOB_NOT_FOUND,
@@ -509,10 +510,90 @@ def _mark_task_as_timeout(task, job_name):
 
 
 def _mark_task_as_completed(task):
-    """Mark task as completed."""
+    """
+    Mark task as completed.
+
+    NOTE: This should only be called after we have ensured results exist and have been
+    ingested into the database (ReportDynamicAnalysis + task.report). Otherwise we
+    can end up with "completed" tasks with missing reports when worker callbacks fail.
+    """
     task.status = STATUS_COMPLETED
     task.completed_at = timezone.now()
     task.save()
+
+
+def _task_has_report(task: AnalysisTask) -> bool:
+    return bool(task.report_id)
+
+
+def _dynamic_result_key_for_task(task: AnalysisTask) -> str:
+    # Contract: task_id is always the deterministic key.
+    return str(task.id)
+
+
+def _load_dynamic_results(result_key: str):
+    from .services.result_storage_service import ResultStorageService
+
+    storage = ResultStorageService()
+    return storage.get_result_content(result_key)
+
+
+def _mark_task_failed_missing_results(task: AnalysisTask, result_key: str) -> None:
+    task.status = STATUS_FAILED
+    task.completed_at = timezone.now()
+    task.error_message = f"No results found for result_key={result_key}"
+    task.error_category = ERROR_CATEGORY_RESULTS_NOT_FOUND
+    details = task.error_details or {}
+    details["results_reconcile"] = {
+        "result_key": result_key,
+        "checked_at": timezone.now().isoformat(),
+    }
+    task.error_details = details
+    task.save()
+
+
+def _attach_report_from_dynamic_results(task: AnalysisTask, results) -> None:
+    from .report_generator import Report
+    from .services.report_service import ReportService
+    from .services.report_artifact_storage_service import ReportArtifactStorageService
+
+    report_data = Report.generate_report(results)
+    payload = {
+        "packages": {
+            "package_name": task.package_name,
+            "package_version": task.package_version,
+            "ecosystem": task.ecosystem,
+        },
+        "report": report_data,
+    }
+    artifact_storage = ReportArtifactStorageService()
+    report_location = artifact_storage.save_report(task.id, payload)
+    report_obj = ReportService.save_report_to_database(payload, report_location=report_location)
+    task.report = report_obj
+    task.save()
+
+
+def _reconcile_results_and_finalize_completion(task: AnalysisTask) -> None:
+    """
+    Best-effort rescue path used by Celery beat when the Go worker callback didn't arrive.
+
+    Command-only: this function mutates task state (no return value).
+    """
+    if _task_has_report(task):
+        _mark_task_as_completed(task)
+        return
+
+    result_key = _dynamic_result_key_for_task(task)
+    results, result_location = _load_dynamic_results(result_key)
+    if not results:
+        _mark_task_failed_missing_results(task, result_key)
+        return
+
+    task.result_location = result_location
+    task.save()
+
+    _attach_report_from_dynamic_results(task, results)
+    _mark_task_as_completed(task)
 
 
 def _get_pod_logs_for_job(k8s_service, job_name):
@@ -573,8 +654,14 @@ def _handle_completed_task(task, job_name, k8s_service, stats):
     with transaction.atomic():
         task.refresh_from_db()
         if task.status == STATUS_PROCESSING:
-            _mark_task_as_completed(task)
-    stats['completed'] += 1
+            _reconcile_results_and_finalize_completion(task)
+
+    # Count based on final state (avoid "completed without report" scenarios).
+    task.refresh_from_db()
+    if task.status == STATUS_COMPLETED and _task_has_report(task):
+        stats["completed"] += 1
+    else:
+        stats["failed"] += 1
     _cleanup_completed_task(task, k8s_service)
 
 
