@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker-2
+  namespace: packamal
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: celery-worker-2
+  template:
+    metadata:
+      labels:
+        app: celery-worker-2
+    spec:
+      serviceAccountName: backend-serviceaccount
+      priorityClassName: packamal-app-priority
+      containers:
+        - name: celery-worker-2
+          image: us-central1-docker.pkg.dev/k8s-packamal/packamal-repo/backend:v1
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: packamal-config
+            - secretRef:
+                name: packamal-secrets
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until nc -z database 5432; do
+                echo "Waiting for database..."
+                sleep 0.5
+              done
+              exec celery -A packamal worker -l info -n worker2@%h -Q maintenance,celery
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL

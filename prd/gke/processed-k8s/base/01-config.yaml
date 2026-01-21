@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: packamal-config
+data:
+  DEBUG: "False"
+  EXECUTION_MODE: "k8s"
+  ALLOWED_HOSTS: "*"
+  CSRF_TRUSTED_ORIGINS: "https://packguard.dev"
+
+  # --- Storage: GCS ---
+  # Static + media (Django)
+  # NOTE: ensure this bucket exists and the Workload Identity GSA has permissions.
+  GCS_BUCKET_NAME: "packamal-k8s-packamal"
+  # Optional: split buckets (recommended if you want public static but private media)
+  # GCS_STATIC_BUCKET_NAME: "packamal-static-k8s-packamal"
+  # GCS_MEDIA_BUCKET_NAME: "packamal-media-k8s-packamal"
+  GCS_STATIC_LOCATION: "static"
+  GCS_MEDIA_LOCATION: "media"
+
+  # Dynamic analysis raw results (Go worker writes here; backend reads here)
+  RESULTS_BUCKET_URL: "gs://packamal-k8s-packamal/dynamic-results/"
+  ANALYSIS_DYNAMIC_BUCKET_URL: "gs://packamal-k8s-packamal/dynamic-results/"
+
+  # Optional: store generated report payloads (JSON) as artifacts too
+  REPORT_ARTIFACTS_BUCKET_URL: "gs://packamal-k8s-packamal/report-artifacts/"
+
+  POSTGRES_DB: "packamal"
+  POSTGRES_USER: "packamal_db"
+  POSTGRES_HOST: "database"
+  POSTGRES_PORT: "5432"
+
+  CELERY_BROKER_URL: "redis://redis-celery:6379/0"
+  CELERY_RESULT_BACKEND: "redis://redis-celery:6379/0"
+  REDIS_CACHE_URL: "redis://redis-report:6379/0"
+
+  INTERNAL_API_BASE_URL: "http://backend:8000/api/v1/internal/callback"
+  ANALYSIS_TIMEOUT: "30m"
+  RESULTS_VOLUME: "analysis_results"
+  CONTAINER_DIR_OVERRIDE: "/tmp/container-lib"
+
+  # Update with your Artifact Registry path
+  ANALYSIS_IMAGE: "us-central1-docker.pkg.dev/k8s-packamal/packamal-repo/go-worker-analysis:v1"
+  SANDBOX_DYNAMIC_ANALYSIS_IMAGE: "docker.io/pakaremon/dynamic-analysis"
+  POD_TIMEOUT_SECONDS: "3600"
+  MAX_CONCURRENT_JOBS: "3"
+  # For testing: avoid PD "Multi-Attach" issues across node pools by using ephemeral storage for analysis job results
+  ANALYSIS_RESULTS_VOLUME_MODE: "gcs"
+
+  # Namespace and scheduling hints for analysis jobs
+  K8S_NAMESPACE: "packamal"
+  # ANALYSIS_NODE_SELECTOR: "nodepool=heavy-analysis"
+  ANALYSIS_NODE_SELECTOR: "role=analysis-worker"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-script
+data:
+  init.sql: |
+    ALTER ROLE packamal_db SET client_encoding TO 'utf8';
+    ALTER ROLE packamal_db SET default_transaction_isolation TO 'read committed';
+    ALTER ROLE packamal_db SET timezone TO 'UTC';
+
+    GRANT CONNECT ON DATABASE packamal TO packamal_db;
+    GRANT USAGE ON SCHEMA public TO packamal_db;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO packamal_db;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO packamal_db;
+
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO packamal_db;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO packamal_db;
+
+    REVOKE ALL ON SCHEMA public FROM public;

@@ -1,0 +1,15 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: packamal-high-priority
+value: 1000000
+globalDefault: false
+description: "High priority for stateful core services (Postgres, Redis)."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: packamal-app-priority
+value: 500000
+globalDefault: false
+description: "App priority for backend and analysis-related workers."

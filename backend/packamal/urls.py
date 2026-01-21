@@ -32,9 +32,10 @@ urlpatterns = [
     # path('package-analysis/', include('package_analysis.urls')),
 ]
 
-# Serve static files
-urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
+# Serve static/media files only in DEBUG and only when using local URL prefixes.
+# In production, static/media should be served by GCS/CDN (or another dedicated asset host).
+if settings.DEBUG and isinstance(settings.STATIC_URL, str) and settings.STATIC_URL.startswith("/"):
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
 
-# Serve media files - works in both DEBUG and production
-if settings.DEBUG:
+if settings.DEBUG and isinstance(settings.MEDIA_URL, str) and settings.MEDIA_URL.startswith("/"):
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

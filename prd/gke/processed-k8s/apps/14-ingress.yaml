@@ -1,0 +1,72 @@
+# Commented out for testing without domain
+# apiVersion: networking.gke.io/v1
+# kind: ManagedCertificate
+# metadata:
+#   name: packamal-managed-cert
+#   namespace: packamal
+# spec:
+#   domains:
+#     - packguard.dev
+# ---
+# apiVersion: networking.gke.io/v1beta1
+# kind: FrontendConfig
+# metadata:
+#   name: packamal-frontend-config
+#   namespace: packamal
+# spec:
+#   redirectToHttps:
+#     enabled: true
+# ---
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: packamal-backendconfig
+  namespace: packamal
+spec:
+  timeoutSec: 600
+  healthCheck:
+    checkIntervalSec: 10
+    timeoutSec: 5
+    healthyThreshold: 1
+    unhealthyThreshold: 3
+    requestPath: /health
+    port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: packamal-ingress
+  namespace: packamal
+  annotations:
+    kubernetes.io/ingress.class: gce
+    # kubernetes.io/ingress.global-static-ip-name: 
+    kubernetes.io/ingress.global-static-ip-name: packamal-static-ip
+    # Commented out for testing without domain/HTTPS
+    # networking.gke.io/managed-certificates: packamal-managed-cert
+    # networking.gke.io/v1beta1.FrontendConfig: packamal-frontend-config
+spec:
+  rules:
+    # Removed host to allow direct IP access for testing
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          - path: /admin
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

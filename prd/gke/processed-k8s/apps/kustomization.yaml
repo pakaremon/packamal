@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: packamal
+resources:
+  - 05-backend.yaml
+  - 06-worker.yaml
+  - 07-frontend.yaml
+  - 08-worker-2.yaml
+  - 09-celery-beat.yaml
+  - 10-flower.yaml
+  - 12-backend-hpa.yaml
+  - 14-ingress.yaml
+  - 15-network-policies.yaml
+
+patches:
+  - target:
+      kind: Deployment
+      labelSelector: "app in (backend, frontend, celery-worker, celery-worker-2, celery-beat, flower)"
+    patch: |-
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          role: app-node

@@ -586,6 +586,14 @@ def _reconcile_results_and_finalize_completion(task: AnalysisTask) -> None:
     result_key = _dynamic_result_key_for_task(task)
     results, result_location = _load_dynamic_results(result_key)
     if not results:
+        # Store the last checked location (fs path or gs://...) to make debugging easier.
+        details = task.error_details or {}
+        details["results_reconcile"] = {
+            "result_key": result_key,
+            "checked_at": timezone.now().isoformat(),
+            "checked_location": result_location,
+        }
+        task.error_details = details
         _mark_task_failed_missing_results(task, result_key)
         return
 

@@ -1,0 +1,127 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: packamal
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+        version: v1
+    spec:
+      serviceAccountName: backend-serviceaccount
+      priorityClassName: packamal-app-priority
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: django-setup
+          image: us-central1-docker.pkg.dev/k8s-packamal/packamal-repo/backend:v1
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          envFrom:
+            - configMapRef:
+                name: packamal-config
+            - secretRef:
+                name: packamal-secrets
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              until nc -z database 5432; do
+                echo "Waiting for database..."
+                sleep 1
+              done
+              python manage.py migrate --noinput --skip-checks
+              python manage.py collectstatic --noinput
+      containers:
+        - name: backend
+          image: us-central1-docker.pkg.dev/k8s-packamal/packamal-repo/backend:v1
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: packamal-config
+            - secretRef:
+                name: packamal-secrets
+          command: ["gunicorn"]
+          args:
+            - packamal.wsgi:application
+            - --bind
+            - 0.0.0.0:8000
+            - --workers
+            - "2"
+            - --threads
+            - "2"
+            - --timeout
+            - "300"
+            - --access-logfile
+            - "-"
+            - --error-logfile
+            - "-"
+          resources:
+            requests:
+              cpu: "300m"
+              memory: "768Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes: []
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: packamal
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+    cloud.google.com/backend-config: '{"default": "packamal-backendconfig"}'
+spec:
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+  type: ClusterIP
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800

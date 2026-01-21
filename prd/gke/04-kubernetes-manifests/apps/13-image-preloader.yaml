@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: image-preloader
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    matchLabels:
+      app: image-preloader
+  template:
+    metadata:
+      labels:
+        app: image-preloader
+    spec:
+      nodeSelector:
+        role: app-node
+      # # Chỉ chạy trên các node thuộc analysis pool
+      # nodeSelector:
+      #   role: analysis-worker
+      
+      # # Cho phép chạy trên các node có Taint
+      # tolerations:
+      #   - key: dedicated
+      #     operator: Equal
+      #     value: analysis
+      #     effect: NoSchedule
+      
+      hostNetwork: true
+      hostPID: true
+      
+      containers:
+        - name: preloader
+          # Sử dụng image alpine nhẹ có cài crictl
+          image: alpine:3.18
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # Cài đặt crictl nếu chưa có
+              apk add --no-cache curl
+              curl -L https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.28.0/crictl-v1.28.0-linux-amd64.tar.gz | tar -xz -C /usr/local/bin
+              
+              echo "🚀 Đang kiểm tra và kéo image dynamic-analysis trên Node: $NODE_NAME"
+              # Lệnh chuẩn để kéo image trực tiếp vào containerd của host
+              crictl pull docker.io/pakaremon/dynamic-analysis:latest
+              
+              echo "✅ Hoàn tất! Image đã sẵn sàng. Giữ container chạy để không bị dọn dẹp."
+              sleep infinity
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: containerd-sock
+              mountPath: /run/containerd/containerd.sock
+      
+      volumes:
+        - name: containerd-sock
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: Socket

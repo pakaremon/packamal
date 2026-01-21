@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gocloud.dev/blob"
@@ -61,7 +62,12 @@ func New(bucket string, options ...Option) *ResultStore {
 	} else {
 		// for non-file schemes, we need to separate the path because OpenBucket
 		// doesn't support turning the path into a key prefix
-		pathPrefix = bucketURL.Path
+		//
+		// IMPORTANT: bucketURL.Path from url.Parse includes a leading "/" (e.g. "/dynamic-results/").
+		// If we keep that leading slash, path.Join will produce object keys like "/dynamic-results/<id>/report.json",
+		// which GCS will show as "gs://bucket//dynamic-results/<id>/report.json".
+		// Normalize to a clean prefix without leading/trailing slashes.
+		pathPrefix = strings.Trim(bucketURL.Path, "/")
 		bucketURL.Path = ""
 		bucketURL.RawPath = ""
 	}

@@ -24,7 +24,8 @@ class K8sService:
         self.is_local = True
         try:
             config.load_incluster_config()
-            logging.info("Loaded in-cluster Kubernetes config (AKS)")
+            logging.info("Loaded in-cluster Kubernetes config")
+            self.is_local = False
         except config.ConfigException:
             config.load_kube_config()
             logging.info("Loaded local kubeconfig (Minikube)")
@@ -32,8 +33,30 @@ class K8sService:
 
         self.batch_v1 = client.BatchV1Api()
         self.core_v1 = client.CoreV1Api()
-        self.namespace = "packamal"
+        self.namespace = os.environ.get("K8S_NAMESPACE", "packamal")
+        self.analysis_node_selector = self._parse_node_selector(
+            os.environ.get("ANALYSIS_NODE_SELECTOR", "")
+        )
         self.sandbox_dynamic_analysis_image = os.environ.get("SANDBOX_DYNAMIC_ANALYSIS_IMAGE", "docker.io/pakaremon/dynamic-analysis")
+
+    @staticmethod
+    def _parse_node_selector(selector: str) -> dict:
+        """
+        Parse a comma-separated node selector string (key=value,key2=value2) into a dict.
+        Returns an empty dict if the input is blank or invalid.
+        """
+        if not selector:
+            return {}
+        node_selector = {}
+        for item in selector.split(","):
+            if "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key and value:
+                node_selector[key] = value
+        return node_selector
 
     @staticmethod
     def _remove_npm_scope_prefix(name: str) -> str:
@@ -99,9 +122,17 @@ class K8sService:
         sanitized_package_name = self._sanitize_for_k8s_name(package_name)
         job_name = f"analysis-{sanitized_package_name}-{job_id}"
 
+        # resources = client.V1ResourceRequirements(
+        #     requests={"cpu": "100m", "memory": "2Gi"},  # Reduced CPU request to fit available resources (250m = 0.25 CPU)
+        #     limits={"cpu": "1.5", "memory": "4Gi"},     # Can burst up to 2 CPUs if available
+        # )
+
         resources = client.V1ResourceRequirements(
-            requests={"cpu": "100m", "memory": "2Gi"},  # Reduced CPU request to fit available resources (250m = 0.25 CPU)
-            limits={"cpu": "1.5", "memory": "3.5Gi"},     # Can burst up to 2 CPUs if available
+            # Requests: what the scheduler must be able to allocate.
+            # Keep this lower to fit on small analysis node pools and to avoid namespace quotas.
+            requests={"cpu": "200m", "memory": "2Gi"},
+            # Limits: allow some burst, but keep under typical per-node capacity.
+            limits={"cpu": "1200m", "memory": "4.6Gi"},
         )
 
         env_vars = [
@@ -162,7 +193,11 @@ class K8sService:
         # using the cached image instead of downloading over the network
         # NOTE: If image doesn't exist locally, it will try to pull from registry
         # For ACR images, ensure the node pool has proper authentication configured
-        pull_policy = "IfNotPresent"
+        # IMPORTANT:
+        # We frequently rebuild/push images with the same tag during testing (e.g. ":v1").
+        # If we keep IfNotPresent, nodes may keep running a cached old image.
+        # Default to Always so fixes in go-worker-analysis are picked up immediately.
+        pull_policy = os.environ.get("ANALYSIS_IMAGE_PULL_POLICY", "Always")
         
         container = client.V1Container(
             name="analysis-worker",
@@ -171,7 +206,13 @@ class K8sService:
             command=["analyze"], # The binary name
             args=[
                 # Only save dynamic analysis results to /results/
-                "-dynamic-bucket", "file:///results/",
+                # Contract: worker writes to this bucket/prefix using TASK_ID as the deterministic key.
+                # Prefer ANALYSIS_DYNAMIC_BUCKET_URL, otherwise fall back to RESULTS_BUCKET_URL.
+                "-dynamic-bucket",
+                os.environ.get(
+                    "ANALYSIS_DYNAMIC_BUCKET_URL",
+                    os.environ.get("RESULTS_BUCKET_URL", "file:///results/"),
+                ),
                 "-ecosystem", ecosystem,
                 "-package", package_name,
                 "-version", package_version,
@@ -188,13 +229,72 @@ class K8sService:
             volume_mounts=volume_mounts,
         )
 
+        # Results storage mode:
+        # - "pvc": persist results via a PVC (default; may Multi-Attach fail across nodes with RWO disks)
+        # - "emptyDir": ephemeral per-pod storage (best for testing / avoids PD attach)
+        results_volume_mode = os.environ.get("ANALYSIS_RESULTS_VOLUME_MODE", "pvc").strip().lower()
+        results_pvc_name = os.environ.get("ANALYSIS_RESULTS_PVC_NAME", "analysis-results-pvc").strip()
+
+        results_volume = (
+            client.V1Volume(
+                name="results",
+                empty_dir=client.V1EmptyDirVolumeSource(),
+            )
+            if results_volume_mode in ("emptydir", "empty_dir", "tmp", "gcs", "gs")
+            else client.V1Volume(
+                name="results",
+                persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                    claim_name=results_pvc_name
+                ),
+            )
+        )
+
+        # PRELOADER INIT CONTAINER:
+        # Instead of running a DaemonSet on every node to pre-pull the 10GB
+        # dynamic-analysis image, we use an initContainer in the analysis Job.
+        #
+        # This initContainer:
+        # - Mounts the host's containerd socket
+        # - Installs crictl
+        # - Runs `crictl pull docker.io/pakaremon/dynamic-analysis:latest`
+        #
+        # As a result, whenever a new analysis node scales up and a Job lands
+        # on it, the initContainer pulls the heavy image into the node's
+        # containerd cache before the main analysis container starts.
+        preloader_image = os.environ.get("ANALYSIS_PRELOADER_IMAGE", "alpine:3.18")
+
+        preloader_init_container = client.V1Container(
+            name="preloader",
+            image=preloader_image,
+            command=["/bin/sh", "-c"],
+            args=[
+                (
+                    "set -e;"
+                    " apk add --no-cache curl;"
+                    " curl -L https://github.com/kubernetes-sigs/cri-tools/releases/download/"
+                    "v1.28.0/crictl-v1.28.0-linux-amd64.tar.gz"
+                    " | tar -xz -C /usr/local/bin;"
+                    ' echo "🚀 Preloading dynamic-analysis image on node...";'
+                    " crictl pull docker.io/pakaremon/dynamic-analysis:latest;"
+                    ' echo "✅ Preload complete";'
+                )
+            ],
+            security_context=client.V1SecurityContext(privileged=True),
+            volume_mounts=[
+                client.V1VolumeMount(
+                    name="containerd-sock",
+                    mount_path="/run/containerd/containerd.sock",
+                ),
+            ],
+            resources=client.V1ResourceRequirements(
+                requests={"cpu": "50m", "memory": "128Mi"},
+                limits={"cpu": "500m", "memory": "512Mi"},
+            ),
+        )
+
         volumes = [
             # NESTED CONTAINER SUPPORT: Use hostPath to share node's container image cache
-            # The image-preloader DaemonSet pre-pulls the 10GB dynamic-analysis image
-            # into /var/lib/containers on each node. By mounting this same path as hostPath,
-            # the analysis job's podman can access the pre-pulled image instantly without
-            # re-downloading 10GB over the network. This enables Docker-in-Docker (podman)
-            # to use the node's existing image cache.
+            # so podman can access the pre-pulled dynamic-analysis image.
             client.V1Volume(
                 name="container-data",
                 host_path=client.V1HostPathVolumeSource(
@@ -202,13 +302,16 @@ class K8sService:
                     type="DirectoryOrCreate"
                 ),
             ),
-            # Persistent storage for main analysis results
+            # Allow the preloader initContainer to talk directly to containerd
+            # on the host in order to pull images into the node-level cache.
             client.V1Volume(
-                name="results",
-                persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
-                    claim_name="analysis-results-pvc"
+                name="containerd-sock",
+                host_path=client.V1HostPathVolumeSource(
+                    path="/run/containerd/containerd.sock",
+                    type="Socket",
                 ),
             ),
+            results_volume,
         ]
 
         # Define the Pod template
@@ -224,27 +327,41 @@ class K8sService:
         # while avoiding PID/cgroup namespace mismatches.
         # - hostNetwork=False keeps network isolation for security
         tolerations = [
-            # Allow scheduling heavy analysis jobs onto a tainted "heavy-analysis" node pool:
-            #   kubectl taint nodes <node-name> heavy-analysis=true:NoSchedule
+            # Allow scheduling heavy analysis jobs onto a tainted "analysis-pool" node pool:
+            #   kubectl taint nodes <node-name> dedicated=analysis:NoSchedule
             client.V1Toleration(
-                key="heavy-analysis",
+                key="dedicated",
                 operator="Equal",
-                value="true",
+                value="analysis",
                 effect="NoSchedule",
             )
+            ,
+            # GKE Sandbox node pools commonly taint nodes with:
+            #   sandbox.gke.io/runtime=gvisor:NoSchedule
+            # If your analysis node pool is created with `--sandbox type=gvisor`,
+            # the autoscaler will NOT scale up unless pods tolerate this taint.
+            client.V1Toleration(
+                key="sandbox.gke.io/runtime",
+                operator="Equal",
+                value="gvisor",
+                effect="NoSchedule",
+            ),
         ]
 
         template = client.V1PodTemplateSpec(
             metadata=client.V1ObjectMeta(labels={"app": "analysis-job"}),
             spec=client.V1PodSpec(
                 restart_policy="Never",
+                # IMPORTANT: Go heavy worker inherits GCP permissions via Workload Identity from this KSA.
                 service_account_name="backend-serviceaccount",
                 priority_class_name="packamal-app-priority",
+                init_containers=[preloader_init_container],
                 containers=[container],
                 volumes=volumes,
                 host_pid=False,
                 host_network=False,  # Keep network isolation
                 tolerations=tolerations,
+                node_selector=self.analysis_node_selector or None,
             )
         )
         # Define the Job specification
@@ -278,7 +395,12 @@ class K8sService:
             logger.info(f"Submitting Job {job_name} to K8s...")
             logger.info(f"  Image: {analysis_image}")
             logger.info(f"  ImagePullPolicy: {pull_policy}")
-            logger.info(f"  PVC: analysis-results-pvc")
+            if results_volume_mode in ("gcs", "gs"):
+                logger.info("  Results storage: GCS (no PVC mounted)")
+            elif results_volume_mode in ("emptydir", "empty_dir", "tmp"):
+                logger.info("  Results volume: emptyDir")
+            else:
+                logger.info(f"  Results PVC: {results_pvc_name}")
             logger.info(f"  ServiceAccount: backend-serviceaccount")
             self.batch_v1.create_namespaced_job(namespace=self.namespace, body=job)
             logger.info(f"Job {job_name} created successfully")

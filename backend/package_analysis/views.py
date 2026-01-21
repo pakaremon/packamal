@@ -372,16 +372,18 @@ def upload_sample(request):
         return JsonResponse({'status': 'error', 'message': 'Invalid request'}, status=HTTP_STATUS_BAD_REQUEST)
     
     file = request.FILES['file']
-    fs = FileSystemStorage()
+    # Always use a local temp directory for uploaded samples so this works even when MEDIA is on GCS.
+    upload_tmp_dir = os.environ.get("UPLOAD_TMP_DIR", "/tmp/uploads")
+    fs = FileSystemStorage(location=upload_tmp_dir)
     filename = fs.save(file.name, file)
-    uploaded_file_url = fs.url(filename)
+    uploaded_file_path = fs.path(filename)
     
     try:
         ecosystem = request.POST.get('ecosystem')
         package_name = request.POST.get('package_name')
         package_version = request.POST.get('package_version')
         
-        reports = Helper.handle_uploaded_file(uploaded_file_url, package_name, package_version, ecosystem)
+        reports = Helper.handle_uploaded_file(uploaded_file_path, package_name, package_version, ecosystem)
         return JsonResponse({"dynamic_analysis_report": reports})
     finally:
         fs.delete(filename)
@@ -932,17 +934,20 @@ def _finalize_task_completion(task, latest_report, duration, download_url):
     task.save()
 
 
-def _handle_missing_results(request, task, task_id):
+def _handle_missing_results(request, task, task_id, checked_location=None):
     """Handle case where results are not found."""
     task.status = STATUS_FAILED
-    task.error_message = 'No results found in mount path'
+    if checked_location:
+        task.error_message = f'No results found in storage location: {checked_location}'
+    else:
+        task.error_message = 'No results found in configured result storage'
     task.error_category = ERROR_CATEGORY_RESULTS_NOT_FOUND
     task.completed_at = timezone.now()
     task.save()
     return json_error(
         request,
         error='No results found',
-        message='Analysis results not found in mount path',
+        message=f'Analysis results not found ({checked_location or "unknown location"})',
         status=HTTP_STATUS_NOT_FOUND
     )
 
@@ -1025,7 +1030,7 @@ def job_completed_api(request):
             results, result_location = storage.get_result_content(result_key)
             if not results:
                 logger.error(f"No results found for task {task_id} (result_key={result_key})")
-                return _handle_missing_results(request, task, task_id)
+                return _handle_missing_results(request, task, task_id, checked_location=result_location)
 
             # Persist neutral storage pointer (path today, URL tomorrow).
             task.result_location = result_location

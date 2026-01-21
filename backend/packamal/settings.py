@@ -178,6 +178,36 @@ STATIC_ROOT = os.environ.get('STATIC_ROOT', str(BASE_DIR / 'staticfiles'))
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.environ.get('MEDIA_ROOT', str(BASE_DIR / 'media'))
 
+# Optional: serve static/media from Google Cloud Storage (GCS)
+# You can use a single bucket (GCS_BUCKET_NAME) or split buckets:
+# - GCS_STATIC_BUCKET_NAME (often public or CDN-fronted)
+# - GCS_MEDIA_BUCKET_NAME  (often private)
+GCS_BUCKET_NAME = (os.environ.get("GCS_BUCKET_NAME") or "").strip()
+GCS_STATIC_BUCKET_NAME = (os.environ.get("GCS_STATIC_BUCKET_NAME") or GCS_BUCKET_NAME).strip()
+GCS_MEDIA_BUCKET_NAME = (os.environ.get("GCS_MEDIA_BUCKET_NAME") or GCS_BUCKET_NAME).strip()
+GCS_STATIC_LOCATION = (os.environ.get("GCS_STATIC_LOCATION") or "static").strip().strip("/")
+GCS_MEDIA_LOCATION = (os.environ.get("GCS_MEDIA_LOCATION") or "media").strip().strip("/")
+
+if GCS_BUCKET_NAME or GCS_STATIC_BUCKET_NAME or GCS_MEDIA_BUCKET_NAME:
+    # Enable django-storages only when bucket is configured.
+    INSTALLED_APPS += ["storages"]
+
+    # Django 5.1 storage configuration
+    STORAGES = {
+        "default": {
+            "BACKEND": "packamal.storage_backends.MediaGoogleCloudStorage",
+        },
+        "staticfiles": {
+            "BACKEND": "packamal.storage_backends.StaticGoogleCloudStorage",
+        },
+    }
+
+    # Public URL base for GCS (can be overridden if you use Cloud CDN / custom domain)
+    static_public_base = (os.environ.get("GCS_STATIC_PUBLIC_BASE_URL") or f"https://storage.googleapis.com/{GCS_STATIC_BUCKET_NAME}").rstrip("/")
+    media_public_base = (os.environ.get("GCS_MEDIA_PUBLIC_BASE_URL") or f"https://storage.googleapis.com/{GCS_MEDIA_BUCKET_NAME}").rstrip("/")
+    STATIC_URL = f"{static_public_base}/{GCS_STATIC_LOCATION}/"
+    MEDIA_URL = f"{media_public_base}/{GCS_MEDIA_LOCATION}/"
+
 # Analysis paths
 ANALYSIS_RESULTS_DIR = os.environ.get('ANALYSIS_RESULTS_INTERNAL_DIR', '/tmp/analysis-results')
 RESOURCES_DIR = BASE_DIR / 'package_analysis' / 'resources'
