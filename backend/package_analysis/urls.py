@@ -9,11 +9,6 @@ urlpatterns = [
     path("api/v1/analyze/", views.analyze_api, name="analyze_api"),
     path("api/v1/task/<int:task_id>/", views.task_status_api, name="task_status_api"),
     path("api/v1/reports/", views.list_tasks_api, name="list_tasks_api"),
-    path(
-        "reports/<str:ecosystem>/<str:package_name>/<str:package_version>.json",
-        views.download_professional_report,
-        name="download_professional_report",
-    ),
     # Internal API Endpoint, this API is called from post-processing heavy Go worker to notify that the Job is completed.
     path("api/v1/internal/callback/done/", views.job_completed_api, name="job_completed_api"),
     # Internal API Endpoint: Go worker notifies backend when analysis times out / fails (tier-1 graceful timeout).
@@ -58,9 +53,9 @@ urlpatterns = [
     path("malcontent/", views.malcontent, name="malcontent"),
     # LastPyMile
     path("lastpymile/", views.lastpymile, name="lastpymile"),
-    path("report/<int:report_id>/", views.report_detail, name="report"),
-    path("get_all_report/", views.get_all_report, name="get_all_report"),
-    path("get_report/<int:report_id>/", views.get_report, name="get_report"),
+    # path("report/<int:report_id>/", views.report_detail, name="report"),
+    # path("get_all_report/", views.get_all_report, name="get_all_report"),
+    # path("get_report/<int:report_id>/", views.get_report, name="get_report"),
     path("analyzed_samples/", views.analyzed_samples, name="analyzed_samples"),
 ]
 

@@ -14,25 +14,21 @@ import subprocess
 from .forms import PackageSubmitForm
 from .helper import Helper
 from .report_generator import Report
-from .models import AnalysisTask, ReportDynamicAnalysis, Package
+from .models import AnalysisTask, Package
 from .src.py2src.py2src.url_finder import URLFinder
 from .utils import PURLParser, validate_purl_format
 from .api_utils import json_success, json_error, api_handler
 from .auth import require_api_key, require_internal_api_token
-from .services.report_service import ReportService, normalize_package_name_for_storage
 from .services.task_service import TaskService
 from .services.package_version_service import PackageVersionService
 from .services.result_storage_service import ResultStorageService
 from .services.report_artifact_storage_service import ReportArtifactStorageService
 from .view_constants import (
-    STATUS_RECEIVED,
     STATUS_QUEUED,
     STATUS_PROCESSING,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_TIMEOUT,
-    # Legacy status constants for backward compatibility
-
     HTTP_STATUS_BAD_REQUEST,
     HTTP_STATUS_NOT_FOUND,
     HTTP_STATUS_METHOD_NOT_ALLOWED,
@@ -56,109 +52,10 @@ from .view_constants import (
 logger = logging.getLogger(__name__)
 
 
-def download_professional_report(request, ecosystem, package_name, package_version):
-    """
-    Serve professional report JSON from Redis (cache).
-
-    On-demand caching strategy:
-    - If Redis miss, check DB for an existing completed AnalysisTask with a report.
-    - If found, (re)generate the professional report into Redis and serve it.
-    - If not found, return 404.
-    """
-    report_blob = ReportService.get_report_from_redis(ecosystem, package_name, package_version)
-    if report_blob:
-        return HttpResponse(report_blob, content_type="application/json")
-
-    normalized_name = normalize_package_name_for_storage(package_name)
-    candidates = (
-        AnalysisTask.objects.filter(
-            status=STATUS_COMPLETED,
-            report__isnull=False,
-            package_version=package_version,
-            ecosystem__iexact=ecosystem,
-        )
-        .order_by("-completed_at", "-id")
-    )
-
-    completed_task = None
-    for t in candidates:
-        if normalize_package_name_for_storage(t.package_name) == normalized_name:
-            completed_task = t
-            break
-
-    if not completed_task:
-        return HttpResponseNotFound("Report not found")
-
-    # Populate Redis on-demand, then serve from Redis (single source of truth for this endpoint).
-    ReportService.save_professional_report(completed_task, request)
-    report_blob = ReportService.get_report_from_redis(ecosystem, package_name, package_version)
-    if not report_blob:
-        return HttpResponseNotFound("Report not found or expired")
-    return HttpResponse(report_blob, content_type="application/json")
+# Legacy functions removed - reports are now served via GCS URLs in artifacts field
 
 
-def save_report_to_database(report_data):
-    """Save report data to database."""
-    ReportService.save_report_to_database(report_data)
-
-
-def _read_results_from_docker_volume(package_name):
-    """Read analysis results from Docker volume for local development."""
-    results_volume = os.getenv("RESULTS_VOLUME", DEFAULT_RESULTS_VOLUME)
-    result_file_name = package_name.lower() + JSON_FILE_EXTENSION
-    
-    docker_cmd = [
-        "docker", "run", "--rm",
-        "-v", f"{results_volume}:/results",
-        "alpine",
-        "cat", f"/results/{result_file_name}",
-    ]
-    
-    try:
-        result = subprocess.run(docker_cmd, check=True, capture_output=True, text=True)
-        return json.loads(result.stdout)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error running Docker command: {e}, stderr: {e.stderr}")
-        return None
-    except json.JSONDecodeError as e:
-        logger.error(f"Error parsing JSON from Docker result: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error reading results via Docker: {e}")
-        return None
-
-
-def _read_results_from_filesystem(package_name):
-    """Read analysis results from filesystem for production (Kubernetes PVC)."""
-    mount_path = os.getenv("MOUNT_PATH", DEFAULT_MOUNT_PATH)
-    result_file_name = package_name.lower() + JSON_FILE_EXTENSION
-    results_file = os.path.join(mount_path, result_file_name)
-    
-    try:
-        with open(results_file, "r") as file:
-            return json.load(file)
-    except FileNotFoundError:
-        logger.error(f"Results file not found: {results_file}")
-        return None
-    except json.JSONDecodeError as e:
-        logger.error(f"Error parsing JSON from {results_file}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Error reading results from mount path: {e}")
-        return None
-
-
-def read_results_from_mount_path(package_name):
-    """Read analysis results based on execution mode.
-    
-    Uses ExecutionConfig to determine whether to read from Docker volume (local)
-    or filesystem (K8s/production).
-    """
-    from .config import ExecutionConfig
-    
-    if ExecutionConfig.should_use_filesystem_results():
-        return _read_results_from_filesystem(package_name)
-    return _read_results_from_docker_volume(package_name)
+# Legacy result reading functions removed - results are now served via GCS URLs
 
 def _extract_form_data(form):
     """Extract package information from validated form."""
@@ -205,48 +102,23 @@ def _queue_celery_task(task):
     from .tasks import run_dynamic_analysis
     return run_dynamic_analysis.apply_async(
         args=[task.id],
-        priority=task.priority,
         queue=CELERY_QUEUE_ANALYSIS
     )
 
 
-def _create_and_queue_task(package_name, package_version, ecosystem):
-    """Create analysis task and queue it."""
-    task = AnalysisTask.objects.create(
-        package_name=package_name,
-        package_version=package_version,
-        ecosystem=ecosystem,
-        status=STATUS_QUEUED
-    )
-    _queue_celery_task(task)
-    return task
-
-
 def dynamic_analysis(request):
-    """Dynamic analysis endpoint - ASYNC with Celery."""
+    """
+    Dynamic analysis endpoint - Legacy UI endpoint.
+    Note: Please use the analyze_api endpoint for programmatic access.
+    """
     if request.method != 'POST':
         form = PackageSubmitForm()
         return render(request, 'package_analysis/analysis/dynamic_analysis.html', {'form': form})
     
-    form = PackageSubmitForm(request.POST)
-    if not form.is_valid():
-        form = PackageSubmitForm()
-        return render(request, 'package_analysis/analysis/dynamic_analysis.html', {'form': form})
-    
-    try:
-        package_name, package_version, ecosystem = _extract_form_data(form)
-        task = _create_and_queue_task(package_name, package_version, ecosystem)
-        return JsonResponse({
-            "status": "pending",
-            "task_id": task.id,
-            "message": "Analysis queued successfully"
-        })
-    except Exception as e:
-        logger.error(f"Error queuing dynamic analysis: {e}")
-        return JsonResponse({
-            "status": "error",
-            "error": str(e)
-        }, status=HTTP_STATUS_INTERNAL_SERVER_ERROR) 
+    return JsonResponse({
+        "status": "error",
+        "error": "Please use the /api/analyze endpoint with PURL format"
+    }, status=HTTP_STATUS_BAD_REQUEST) 
 
 def malcontent(request):
     """Run malcontent analysis."""
@@ -289,37 +161,27 @@ def find_typosquatting(request):
 
 def task_status(request, task_id):
     """
-    API endpoint to check task status for async analysis
-    Returns: task status, progress, and results when completed
+    Legacy UI endpoint to check task status.
+    Note: Please use /api/tasks/<task_id> for programmatic access.
     """
     try:
         task = AnalysisTask.objects.get(id=task_id)
         
         response_data = {
             'task_id': task.id,
-            'status': task.status,  # queued, running, completed, failed
-            'package_name': task.package_name,
-            'package_version': task.package_version,
-            'ecosystem': task.ecosystem,
+            'status': task.status,
+            'purl': task.purl,
             'created_at': task.created_at.isoformat() if task.created_at else None,
         }
         
-        if task.started_at:
-            response_data['started_at'] = task.started_at.isoformat()
-        
         if task.completed_at:
             response_data['completed_at'] = task.completed_at.isoformat()
-            if task.duration_seconds:
-                response_data['duration_seconds'] = task.duration_seconds
         
-        if task.worker_id:
-            response_data['worker_id'] = task.worker_id
-        
-        if task.status == STATUS_COMPLETED and task.result:
-            response_data['dynamic_analysis_report'] = task.result
+        if task.status == STATUS_COMPLETED and task.report_blob_url:
+            response_data['report_blob_url'] = task.report_blob_url
         
         if task.status == STATUS_FAILED:
-            response_data['error_message'] = task.error_message if hasattr(task, 'error_message') else 'Unknown error'
+            response_data['error_message'] = task.error_message if task.error_message else 'Unknown error'
         
         return JsonResponse(response_data)
         
@@ -390,53 +252,55 @@ def upload_sample(request):
 
 
 def submit_sample(request):
-    """Submit sample for analysis - redirects to dynamic_analysis."""
+    """
+    Submit sample for analysis - Legacy UI endpoint.
+    Note: Please use the /api/analyze endpoint for programmatic access.
+    """
     if request.method == 'POST':
-        form = PackageSubmitForm(request.POST)
-        if form.is_valid():
-            package_name, package_version, ecosystem = _extract_form_data(form)
-            task = _create_and_queue_task(package_name, package_version, ecosystem)
-            return JsonResponse({
-                "status": "pending",
-                "task_id": task.id,
-                "message": "Analysis queued successfully"
-            })
-        return JsonResponse({"status": "error", "error": "Invalid form data"}, status=HTTP_STATUS_BAD_REQUEST)
+        return JsonResponse({
+            "status": "error",
+            "error": "Please use the /api/analyze endpoint with PURL format"
+        }, status=HTTP_STATUS_BAD_REQUEST)
     
     form = PackageSubmitForm()
     return render(request, 'package_analysis/dashboard.html', {'form': form})
 
 
-def report_detail(request, report_id):
-    '''Report detail analysis result of the package'''
-    report = ReportDynamicAnalysis.objects.get(pk=report_id)
-    return render(request, 'package_analysis/report_detail.html', {'report': report})
+# def report_detail(request, report_id):
+#     '''Report detail analysis result of the package'''
+#     report = ReportDynamicAnalysis.objects.get(pk=report_id)
+#     return render(request, 'package_analysis/report_detail.html', {'report': report})
 
-def get_all_report(request):
-    """Get all analysis reports."""
-    reports = ReportDynamicAnalysis.objects.all()
-    results = {
-        report.id: {
-            'id': report.id,
-            'package_name': report.package.package_name,
-            'package_version': report.package.package_version,
-            'ecosystem': report.package.ecosystem,
-            'time': report.time,
-        }
-        for report in reports
-    }
-    return JsonResponse(results)
+# def get_all_report(request):
+#     """Get all analysis reports."""
+#     reports = ReportDynamicAnalysis.objects.all()
+#     results = {
+#         report.id: {
+#             'id': report.id,
+#             'package_name': report.package.package_name,
+#             'package_version': report.package.package_version,
+#             'ecosystem': report.package.ecosystem,
+#             'verdict': report.verdict,
+#             'score': report.score,
+#             'created_at': report.created_at.isoformat() if report.created_at else None,
+#         }
+#         for report in reports
+#     }
+#     return JsonResponse(results)
 
-def get_report(request, report_id):
-    report = ReportDynamicAnalysis.objects.get(pk=report_id)
-    results = {
-        'package_name': report.package.package_name,
-        'package_version': report.package.package_version,
-        'ecosystem': report.package.ecosystem,
-        'time': report.time,
-        'report_data': report.report,
-    }
-    return JsonResponse(results)
+# def get_report(request, report_id):
+#     report = ReportDynamicAnalysis.objects.get(pk=report_id)
+#     results = {
+#         'package_name': report.package.package_name,
+#         'package_version': report.package.package_version,
+#         'ecosystem': report.package.ecosystem,
+#         'verdict': report.verdict,
+#         'score': report.score,
+#         'artifacts': report.artifacts,
+#         'bucket_path': report.bucket_path,
+#         'created_at': report.created_at.isoformat() if report.created_at else None,
+#     }
+#     return JsonResponse(results)
 
 def analyzed_samples(request):
     '''List of analyzed samples, sorted by id'''
@@ -523,64 +387,21 @@ def get_pypi_versions(request):
     return JsonResponse({"versions": versions})
 
 
-def get_predicted_download_url(request, package_name, package_version, ecosystem):
-    """Get the predicted download URL for the final JSON report."""
-    download_path = ReportService.build_download_path(ecosystem, package_name, package_version)
-    return request.build_absolute_uri(download_path)
+# Legacy function removed - reports are now served via GCS URLs in artifacts field
 
 
-def _parse_purl_request(request):
-    """Parse and validate PURL from request body."""
-    data = json.loads(request.body)
-    purl = data.get('purl')
-    priority = data.get('priority', 0)
-    
-    if not purl:
-        return None, None, json_error(
-            request, error='Missing PURL', message='PURL parameter is required', status=HTTP_STATUS_BAD_REQUEST
-        )
-    
-    if not validate_purl_format(purl):
-        return None, None, json_error(
-            request, error='Invalid PURL format', 
-            message='PURL must be a valid package URL starting with pkg:', status=HTTP_STATUS_BAD_REQUEST
-        )
-    
-    try:
-        package_name, package_version, ecosystem = PURLParser.extract_package_info(purl)
-        return (purl, priority, package_name, package_version, ecosystem), None
-    except ValueError as e:
-        return None, None, json_error(
-            request, error='PURL parsing failed', message=str(e), status=HTTP_STATUS_BAD_REQUEST
-        )
+# Legacy PURL parsing function removed - logic moved inline to analyze_api
 
 
-def _build_completed_task_response(completed_task, request):
-    """Build response for completed task."""
-    download_url = get_predicted_download_url(
-        request,
-        completed_task.package_name,
-        completed_task.package_version,
-        completed_task.ecosystem,
-    )
-    return JsonResponse({
-        'task_id': completed_task.id,
-        'status': STATUS_COMPLETED,
-        'result_url': download_url,
-        'message': 'Analysis already exists (cached result)'
-    })
 
-
-def _build_active_task_response(active_task, package_name, package_version, ecosystem, request):
+def _build_active_task_response(active_task, request):
     """Build response for active task."""
-    predicted_download_url = get_predicted_download_url(request, package_name, package_version, ecosystem)
     status_url = request.build_absolute_uri(reverse('task_status_api', args=[active_task.id]))
     
     return json_success(request, {
         'task_id': active_task.id,
         'status': active_task.status,
         'status_url': status_url,
-        'result_url': predicted_download_url,
         'message': f'Analysis already {active_task.status}'
     })
 
@@ -590,43 +411,13 @@ def _find_completed_task_for_purl(purl):
     return AnalysisTask.objects.filter(
         purl=purl,
         status=STATUS_COMPLETED,
-        report__isnull=False
     ).order_by('-completed_at').first()
 
 
-def _find_active_tasks_for_purl(purl):
-    """Find active tasks for the given PURL."""
-    return AnalysisTask.objects.filter(
-        purl=purl,
-        status__in=[STATUS_PROCESSING, STATUS_QUEUED, STATUS_RECEIVED],
-        created_at__gte=timezone.now() - timezone.timedelta(hours=ACTIVE_TASK_WINDOW_HOURS)
-    ).order_by('-created_at')
 
 
-def _extract_purl_data(request):
-    """Extract and validate PURL data from request."""
-    data = json.loads(request.body)
-    purl = data.get('purl')
-    priority = data.get('priority', 0)
-    
-    if not purl:
-        return None, None, None, json_error(
-            request, error='Missing PURL', message='PURL parameter is required', status=HTTP_STATUS_BAD_REQUEST
-        )
-    
-    if not validate_purl_format(purl):
-        return None, None, None, json_error(
-            request, error='Invalid PURL format', 
-            message='PURL must be a valid package URL starting with pkg:', status=HTTP_STATUS_BAD_REQUEST
-        )
-    
-    try:
-        package_name, package_version, ecosystem = PURLParser.extract_package_info(purl)
-        return purl, priority, (package_name, package_version, ecosystem), None
-    except ValueError as e:
-        return None, None, None, json_error(
-            request, error='PURL parsing failed', message=str(e), status=HTTP_STATUS_BAD_REQUEST
-        )
+
+# Legacy PURL extraction function removed - logic moved inline to analyze_api
 
 
 
@@ -647,7 +438,6 @@ def analyze_api(request):
     try:
         data = json.loads(request.body)
         purl = data.get('purl')
-        priority = data.get('priority', 0)
         
         if not purl:
             return json_error(request, error='Missing PURL', message='PURL parameter is required', status=HTTP_STATUS_BAD_REQUEST)
@@ -655,41 +445,31 @@ def analyze_api(request):
         if not validate_purl_format(purl):
             return json_error(request, error='Invalid PURL format', message='PURL must be a valid package URL starting with pkg:', status=HTTP_STATUS_BAD_REQUEST)
         
-        try:
-            package_name, package_version, ecosystem = PURLParser.extract_package_info(purl)
-        except ValueError as e:
-            return json_error(request, error='PURL parsing failed', message=str(e), status=HTTP_STATUS_BAD_REQUEST)
-        
         completed_task = AnalysisTask.objects.filter(
             purl=purl,
             status=STATUS_COMPLETED,
-            report__isnull=False
         ).order_by('-completed_at').first()
+        
         
         if completed_task:
             logger.debug(f"Found completed task {completed_task.id} for PURL: {purl}")
-            download_url = get_predicted_download_url(
-                request,
-                completed_task.package_name,
-                completed_task.package_version,
-                completed_task.ecosystem,
-            )
+            status_url = request.build_absolute_uri(reverse('task_status_api', args=[completed_task.id]))
             return JsonResponse({
                 'task_id': completed_task.id,
                 'status': STATUS_COMPLETED,
-                'result_url': download_url,
+                'status_url': status_url,
                 'message': 'Analysis already exists'
             })
         
         existing_active_tasks = AnalysisTask.objects.filter(
             purl=purl,
-            status__in=[STATUS_PROCESSING, STATUS_QUEUED, STATUS_RECEIVED],
+            status__in=[STATUS_PROCESSING, STATUS_QUEUED],
             created_at__gte=timezone.now() - timezone.timedelta(hours=ACTIVE_TASK_WINDOW_HOURS)
         ).order_by('-created_at')
         
         active_task = existing_active_tasks.first()
         if active_task:
-            return _build_active_task_response(active_task, package_name, package_version, ecosystem, request)
+            return _build_active_task_response(active_task, request)
         
         last_check = existing_active_tasks.filter(
             created_at__gte=timezone.now() - timezone.timedelta(minutes=RACE_CONDITION_CHECK_MINUTES)
@@ -707,11 +487,7 @@ def analyze_api(request):
         task = AnalysisTask.objects.create(
             api_key=request.api_key,
             purl=purl,
-            package_name=package_name,
-            package_version=package_version,
-            ecosystem=ecosystem,
-            status=STATUS_RECEIVED,
-            priority=priority,
+            status=STATUS_QUEUED,
         )
         
         logger.debug(f"Created new task {task.id} for PURL: {purl}")
@@ -723,13 +499,10 @@ def analyze_api(request):
             logger.info(f"Queued task {task.id} via Celery (Celery ID: {celery_task.id})")
             
             status_url = request.build_absolute_uri(reverse('task_status_api', args=[task.id]))
-            predicted_download_url = get_predicted_download_url(request, package_name, package_version, ecosystem)
 
             return json_success(request, {
                 'task_id': task.id,
-                'status': STATUS_QUEUED,
                 'status_url': status_url,
-                'result_url': predicted_download_url,
                 'message': 'Analysis queued successfully'
             }, status=HTTP_STATUS_CREATED)
             
@@ -750,73 +523,31 @@ def analyze_api(request):
 @api_handler
 def task_status_api(request, task_id):
     """
-    API endpoint to check analysis task status
+    API endpoint to check analysis task status.
+    
+    - If status != 'completed': Return status only
+    - If status == 'completed': Return status AND artifacts (GCS URLs)
     """
     try:
         task = AnalysisTask.objects.get(id=task_id)
 
-        expected_download_url = get_predicted_download_url(request, task.package_name, task.package_version, task.ecosystem)
         response_data = {
             'task_id': task.id,
             'purl': task.purl,
             'status': task.status,
             'created_at': task.created_at.isoformat(),
-            'expected_download_url': expected_download_url,
-            'package_name': task.package_name,
-            'package_version': task.package_version,
-            'ecosystem': task.ecosystem,
-            'priority': task.priority,
-            'timeout_minutes': task.timeout_minutes,
-            'container_id': task.container_id,
-            'last_heartbeat': task.last_heartbeat.isoformat() if task.last_heartbeat else None
         }
-        
-        if task.started_at:
-            response_data['started_at'] = task.started_at.isoformat()
-            
-            if task.status == STATUS_PROCESSING:
-                remaining_time = task.get_remaining_time_minutes()
-                response_data['remaining_time_minutes'] = remaining_time
-                response_data['is_timed_out'] = task.is_timed_out()
         
         if task.completed_at:
             response_data['completed_at'] = task.completed_at.isoformat()
         
         if task.error_message:
             response_data['error_message'] = task.error_message
-            response_data['error_category'] = task.error_category
-            if task.error_details:
-                response_data['error_details'] = task.error_details
         
-        if task.status == STATUS_COMPLETED and task.report:
-            response_data['result_url'] = request.build_absolute_uri(
-                reverse('get_report', args=[task.report.id])
-            )
-            if task.download_url:
-                response_data['download_url'] = task.download_url
-                # Also provide report metadata if available
-                try:
-                    import os
-                    from django.conf import settings
-                    if task.download_url:
-                        # Extract filename from download URL
-                        filename = os.path.basename(task.download_url)
-                        save_dir = getattr(settings, 'MEDIA_ROOT', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'media'))
-                        # Try to find the file and get its metadata
-                        for root, dirs, files in os.walk(os.path.join(save_dir, 'reports')):
-                            if filename in files:
-                                file_path = os.path.join(root, filename)
-                                response_data['report_metadata'] = {
-                                    'filename': filename,
-                                    'size_bytes': os.path.getsize(file_path),
-                                    'created_at': task.completed_at.isoformat() if task.completed_at else None,
-                                    'download_url': task.download_url,
-                                    'folder_structure': os.path.relpath(root, save_dir) + '/'
-                                }
-                                break
-                except Exception as e:
-                    logger.warning(f"Could not generate report metadata: {e}")
-        
+        # If completed, return the artifacts (GCS URLs)
+        if task.status == STATUS_COMPLETED and task.report_blob_url:
+            response_data['report_blob_url'] = task.report_blob_url
+
         return json_success(request, response_data)
         
     except AnalysisTask.DoesNotExist:
@@ -867,14 +598,8 @@ def list_tasks_api(request):
             'purl': t.purl,
             'status': t.status,
             'created_at': t.created_at.isoformat(),
-            'package_name': t.package_name,
-            'package_version': t.package_version,
-            'ecosystem': t.ecosystem,
-            'priority': t.priority,
-            'result_url': (request.build_absolute_uri(reverse('get_report', args=[t.report.id])) if t.report else None),
-            'download_url': t.download_url,
+            'status_url': request.build_absolute_uri(reverse('task_status_api', args=[t.id])),
             'error_message': t.error_message if t.error_message else None,
-            'error_category': t.error_category if t.error_category else None,
         }
         for t in qs[start:end]
     ]
@@ -898,58 +623,7 @@ def _extract_task_id_from_request(request):
     return request.POST.get('task_id')
 
 
-def _process_analysis_results(task, results):
-    """Process analysis results and generate report."""
-    report_data = Report.generate_report(results)
-    report_payload = {
-        "packages": {
-            "package_name": task.package_name,
-            "package_version": task.package_version,
-            "ecosystem": task.ecosystem,
-        },
-        "report": report_data,
-    }
-    artifact_storage = ReportArtifactStorageService()
-    report_location = artifact_storage.save_report(task.id, report_payload)
-    ReportService.save_report_to_database(report_payload, report_location=report_location)
-    return ReportDynamicAnalysis.objects.latest('id')
-
-
-def _calculate_task_duration(task):
-    """Calculate task duration in seconds."""
-    if task.started_at:
-        return (timezone.now() - task.started_at).total_seconds()
-    return None
-
-
-def _finalize_task_completion(task, latest_report, duration, download_url):
-    """Finalize task completion with all metadata."""
-    task.status = STATUS_COMPLETED
-    task.completed_at = timezone.now()
-    task.report = latest_report
-    if duration is not None and hasattr(task, 'duration_seconds'):
-        task.duration_seconds = duration
-    if download_url:
-        task.download_url = download_url
-    task.save()
-
-
-def _handle_missing_results(request, task, task_id, checked_location=None):
-    """Handle case where results are not found."""
-    task.status = STATUS_FAILED
-    if checked_location:
-        task.error_message = f'No results found in storage location: {checked_location}'
-    else:
-        task.error_message = 'No results found in configured result storage'
-    task.error_category = ERROR_CATEGORY_RESULTS_NOT_FOUND
-    task.completed_at = timezone.now()
-    task.save()
-    return json_error(
-        request,
-        error='No results found',
-        message=f'Analysis results not found ({checked_location or "unknown location"})',
-        status=HTTP_STATUS_NOT_FOUND
-    )
+# Legacy helper functions removed - results are now served via GCS URLs
 
 
 @csrf_exempt
@@ -957,18 +631,21 @@ def _handle_missing_results(request, task, task_id, checked_location=None):
 @api_handler
 def job_completed_api(request):
     """
-    API endpoint called by Go worker when job completes.
+    API endpoint called by K8s worker when job completes.
     
-    Processes results and marks task as completed. Handles race condition
-    where watcher may have already marked task as completed - still processes
-    results if report doesn't exist yet.
+    Supports multiple phases and formats:
     
-    When called, it:
-    1. Reads analysis results from mount path
-    2. Generates and saves report to database
-    3. Creates professional report
-    4. Updates task status from 'processing' to 'completed'
-    5. Triggers K8s job cleanup
+    PHASE 1 (Current - Single File):
+    {
+        "task_id": "<id>",
+        "status": "completed" or "failed",
+        "reason": "balabala",
+    }
+    
+    
+
+    
+    Backend automatically detects which phase based on file existence.
     """
     if request.method != 'POST':
         return json_error(
@@ -978,126 +655,228 @@ def job_completed_api(request):
             status=HTTP_STATUS_METHOD_NOT_ALLOWED
         )
 
-    task_id = _extract_task_id_from_request(request)
-    if not task_id:
+    try:
+        data = json.loads(request.body)
+        task_id = data.get('task_id')
+        
+        if not task_id:
+            return json_error(
+                request,
+                error='Missing task_id',
+                message='task_id parameter is required',
+                status=HTTP_STATUS_BAD_REQUEST
+            )
+    except json.JSONDecodeError:
         return json_error(
             request,
-            error='Missing task_id',
-            message='task_id parameter is required',
-            status=400
+            error='Invalid JSON',
+            message='Request body must be valid JSON',
+            status=HTTP_STATUS_BAD_REQUEST
         )
-
-    # Deterministic storage key (directory) for reading results.
-    # Contract: result_key == task_id, so the callback only needs task_id.
-    result_key = str(task_id)
     
     try:
-        with transaction.atomic():
-            def _trigger_next_on_commit():
-                from .tasks import check_and_trigger_next_analysis
-                transaction.on_commit(lambda: check_and_trigger_next_analysis.delay())
-
-            task = AnalysisTask.objects.select_for_update().get(id=task_id)
-            
-            if task.status not in [STATUS_PROCESSING, STATUS_COMPLETED]:
-                logger.warning(
-                    f"Task {task_id} is in status '{task.status}', "
-                    f"not processing or completed. Skipping."
-                )
-                return json_success(request, {
-                    'message': f'Task already in status: {task.status}',
-                    'task_id': task_id,
-                    'status': task.status
-                })
-            
-            if task.status == STATUS_COMPLETED and task.report:
-                logger.info(f"Task {task_id} already completed with report")
-                _trigger_next_on_commit()
-                predicted_download_url = get_predicted_download_url(
-                    request,
-                    task.package_name,
-                    task.package_version,
-                    task.ecosystem,
-                )
-                return json_success(request, {
-                    'message': 'Task already completed',
-                    'task_id': task_id,
-                    'status': STATUS_COMPLETED,
-                    'download_url': predicted_download_url
-                })
-
-            storage = ResultStorageService()
-            results, result_location = storage.get_result_content(result_key)
-            if not results:
-                logger.error(f"No results found for task {task_id} (result_key={result_key})")
-                return _handle_missing_results(request, task, task_id, checked_location=result_location)
-
-            # Persist neutral storage pointer (path today, URL tomorrow).
-            task.result_location = result_location
-            task.save()
-            
-            latest_report = _process_analysis_results(task, results)
-            duration = _calculate_task_duration(task)
-            
-            task.report = latest_report
-            task.save()
-
-            predicted_download_url = get_predicted_download_url(
-                request,
-                task.package_name,
-                task.package_version,
-                task.ecosystem,
-            )
-            _finalize_task_completion(task, latest_report, duration, predicted_download_url)
-            
-            logger.info(f"Task {task_id} completed successfully via worker callback")
-            
-            from .services.k8s_service import K8sService
-            from .tasks import _cleanup_completed_task
-            if task.job_id:
-                try:
-                    k8s_service = K8sService()
-                    _cleanup_completed_task(task, k8s_service)
-                except Exception as cleanup_error:
-                    logger.warning(f"Failed to cleanup K8s job for task {task_id}: {cleanup_error}")
-
-            _trigger_next_on_commit()
-            
-            return json_success(request, {
-                'message': 'Job completed successfully',
-                'task_id': task_id,
-                'status': STATUS_COMPLETED,
-                'download_url': predicted_download_url,
-                'report_id': latest_report.id
-            })
-            
+        return _handle_job_completion(request, task_id)
     except AnalysisTask.DoesNotExist:
-        return json_error(
-            request,
-            error='Task not found',
-            message=f'Analysis task {task_id} not found',
-            status=404
-        )
-    except Exception as e:
-        logger.error(f"Error processing job completion for task {task_id}: {e}")
-        logger.error(traceback.format_exc())
+        return _handle_task_not_found(request, task_id)
+    except Exception as error:
+        return _handle_completion_error(request, task_id, error)
+
+
+def _handle_job_completion(request, task_id: int):
+    """Handles job completion with transaction and triggers."""
+    with transaction.atomic():
+        task = _lock_task_for_completion(task_id)
+
+        # 1. Guard Clauses: Handle special cases early to avoid deep nesting
+        if _should_skip_completion(task):
+            return _create_skip_response(request, task)
+
+        if _is_already_completed(task):
+            _schedule_next_analysis()
+            return _create_already_completed_response(request, task_id)
+
+        # 2. Logic: Process the artifacts
+        blob_url, bucket_path = _ensure_artifacts_available(task, task_id)
         
-        try:
-            task = AnalysisTask.objects.get(id=task_id)
-            task.status = STATUS_FAILED
-            task.error_message = str(e)
-            task.error_category = ERROR_CATEGORY_CALLBACK_ERROR
-            task.completed_at = timezone.now()
-            task.save()
-        except Exception:
-            pass
+        if not blob_url:
+            _mark_task_failed_on_error(task, "Artifacts not found")
+            _cleanup_k8s_job_if_exists(task, task_id)
+            _schedule_next_analysis()
+            return _create_completion_error_response(
+                request, task_id, FileNotFoundError("Analysis failed - no artifacts found in GCS")
+            )
+
+        # 3. Success Path: Clear and focused
+        _make_completed_task(task, blob_url, bucket_path)
+        _cleanup_k8s_job_if_exists(task, task_id)
+        _schedule_next_analysis()
         
-        return json_error(
-            request,
-            error='Internal server error',
-            message=str(e),
-            status=HTTP_STATUS_INTERNAL_SERVER_ERROR
-        )
+        return _create_success_response(request, task_id)
+
+def _lock_task_for_completion(task_id: int):
+    """Locks task row for atomic update."""
+    return AnalysisTask.objects.select_for_update().get(id=task_id)
+
+
+def _should_skip_completion(task: AnalysisTask) -> bool:
+    """Checks if task completion should be skipped."""
+    return task.status not in [STATUS_PROCESSING, STATUS_COMPLETED]
+
+
+def _is_already_completed(task: AnalysisTask) -> bool:
+    """Checks if task already completed with report."""
+    return task.status == STATUS_COMPLETED and task.report_blob_url
+
+
+def _create_skip_response(request, task: AnalysisTask):
+    """Creates response for skipped completion."""
+    logger.warning(f"Task {task.id} in status '{task.status}', skipping")
+    return json_success(request, {
+        'message': f'Task already in status: {task.status}',
+        'task_id': task.id,
+        'status': task.status
+    })
+
+
+def _create_already_completed_response(request, task_id: int):
+    """Creates response for already completed task."""
+    logger.info(f"Task {task_id} already completed with report")
+    return json_success(request, {
+        'message': 'Task already completed',
+        'task_id': task_id,
+        'status': STATUS_COMPLETED
+    })
+
+
+def _ensure_artifacts_available(task, task_id: int):
+    return _construct_missing_artifacts_data(task, task_id)
+
+
+def _construct_missing_artifacts_data(task, task_id: int):
+    """
+    Constructs missing artifacts URLs and bucket path.
+    
+    Phase 1: Simple path {task_id}/report.json
+    Avoids URL encoding issues with package names.
+    """
+    from .services.gcs_artifacts_service import GCSArtifactsService
+    
+    gcs_service = GCSArtifactsService()
+    
+    blob_url = _construct_artifacts_urls(gcs_service, task_id)
+    bucket_path = _construct_bucket_path(gcs_service, task_id)
+    
+    return blob_url, bucket_path
+
+
+def _construct_artifacts_urls(gcs_service, task_id: int):
+    """
+    Constructs artifacts URL for Phase 1.
+    
+    Phase 1: Simple path {task_id}/report.json
+    Worker uploads single file to avoid complexity.
+    """
+    if gcs_service.check_single_result_exists(task_id):
+        logger.info(f"Task {task_id}: Found single result file at {task_id}/report.json")
+        single_url = gcs_service.get_single_result_url(task_id)
+        return single_url
+    
+    logger.warning(f"Task {task_id}: No artifacts found at {task_id}/report.json")
+    return None
+
+
+def _construct_bucket_path(gcs_service, task_id: int):
+    """Constructs bucket path: {task_id}/"""
+    return gcs_service.get_bucket_path(task_id)
+
+
+def _make_completed_task(task: AnalysisTask, blob_url: str, bucket_path: str):
+    """Creates report and marks task as completed."""
+
+    task.report_blob_url = blob_url
+    
+    task.status = STATUS_COMPLETED
+    task.completed_at = timezone.now()
+    task.save()
+    
+    logger.info(f"Task {task.id} completed successfully via worker callback")
+    return task
+
+
+
+def _cleanup_k8s_job_if_exists(task: AnalysisTask, task_id: int):
+    """Cleans up K8s job if task has job_id."""
+    if not task.job_id:
+        return
+    
+    try:
+        from .services.k8s_service import K8sService
+        from .tasks import _cleanup_completed_task
+        
+        k8s_service = K8sService()
+        _cleanup_completed_task(task, k8s_service)
+    except Exception as cleanup_error:
+        logger.warning(f"Failed to cleanup K8s job for task {task_id}: {cleanup_error}")
+
+
+def _schedule_next_analysis():
+    """Schedules next analysis task on transaction commit."""
+    from .tasks import check_and_trigger_next_analysis
+    transaction.on_commit(lambda: check_and_trigger_next_analysis.delay())
+
+
+def _create_success_response(request, task_id: int):
+    """Creates successful completion response."""
+    return json_success(request, {
+        'message': 'Job completed successfully',
+        'task_id': task_id,
+        'status': STATUS_COMPLETED
+    })
+
+def _create_completion_error_response(request, task_id: int, error: Exception):
+    return json_error(
+        request,
+        error='Completion error',
+        message=f'Error processing job completion for task {task_id}: {error}',
+        status=HTTP_STATUS_INTERNAL_SERVER_ERROR
+    )
+
+
+def _handle_task_not_found(request, task_id: int):
+    """Handles case when task not found."""
+    return json_error(
+        request,
+        error='Task not found',
+        message=f'Analysis task {task_id} not found',
+        status=HTTP_STATUS_NOT_FOUND
+    )
+
+
+def _handle_completion_error(request, task_id: int, error: Exception):
+    """Handles errors during job completion."""
+    logger.error(f"Error processing job completion for task {task_id}: {error}")
+    logger.error(traceback.format_exc())
+    
+    _mark_task_failed_on_error(task_id, error)
+    
+    return json_error(
+        request,
+        error='Internal server error',
+        message=str(error),
+        status=HTTP_STATUS_INTERNAL_SERVER_ERROR
+    )
+
+
+def _mark_task_failed_on_error(task_id: int, error: Exception):
+    """Marks task as failed when error occurs during completion."""
+    try:
+        task = AnalysisTask.objects.get(id=task_id)
+        task.status = STATUS_FAILED
+        task.error_message = str(error)
+        task.completed_at = timezone.now()
+        task.save()
+    except Exception:
+        pass
 
 
 @csrf_exempt
@@ -1172,21 +951,11 @@ def job_timeout_api(request):
     def _apply_task_failure(task, failure_status, failure_reason):
         if failure_status == 'timeout':
             task.status = STATUS_TIMEOUT
-            task.error_category = ERROR_CATEGORY_TIMEOUT
         else:
             task.status = STATUS_FAILED
-            task.error_category = ERROR_CATEGORY_WORKER_FAILED
 
         task.error_message = failure_reason
         task.completed_at = timezone.now()
-
-        details = task.error_details or {}
-        details[CALLBACK_KEY] = {
-            'status': failure_status,
-            'reason': failure_reason,
-            'received_at': timezone.now().isoformat(),
-        }
-        task.error_details = details
         task.save()
 
     def _cleanup_k8s_job(task, task_id_for_log):

@@ -2,7 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: default-deny-ingress
-  namespace: packamal
+  namespace: packamal-dev
 spec:
   podSelector: {}
   policyTypes:
@@ -12,7 +12,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: allow-frontend-ingress
-  namespace: packamal
+  namespace: packamal-dev
 spec:
   podSelector:
     matchLabels:
@@ -31,7 +31,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: allow-backend-ingress
-  namespace: packamal
+  namespace: packamal-dev
 spec:
   podSelector:
     matchLabels:
@@ -50,7 +50,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: allow-postgres-from-app
-  namespace: packamal
+  namespace: packamal-dev
 spec:
   podSelector:
     matchLabels:
@@ -79,7 +79,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: allow-redis-celery-from-app
-  namespace: packamal
+  namespace: packamal-dev
 spec:
   podSelector:
     matchLabels:
@@ -108,7 +108,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: allow-redis-report-from-backend
-  namespace: packamal
+  namespace: packamal-dev
 spec:
   podSelector:
     matchLabels:

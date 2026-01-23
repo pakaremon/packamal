@@ -132,7 +132,7 @@ class K8sService:
             # Keep this lower to fit on small analysis node pools and to avoid namespace quotas.
             requests={"cpu": "200m", "memory": "2Gi"},
             # Limits: allow some burst, but keep under typical per-node capacity.
-            limits={"cpu": "1200m", "memory": "4.6Gi"},
+            limits={"cpu": "800m", "memory": "4.6Gi"},
         )
 
         env_vars = [

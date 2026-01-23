@@ -10,14 +10,6 @@ while ! pg_isready -h database -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"; do
 done
 echo "✓ Database is ready!"
 
-echo "Making migrations..."
-python manage.py makemigrations
-echo "✓ Migrations made!"
-
-echo "Running migrations..."
-python manage.py migrate --noinput
-echo "✓ Migrations complete!"
-
 echo "Collecting static files..."
 python manage.py collectstatic --noinput --clear
 echo "✓ Static files collected!"

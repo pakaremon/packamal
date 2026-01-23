@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: celery-worker-2
-  namespace: packamal
+  namespace: packamal-dev
 spec:
   replicas: 0
   selector:

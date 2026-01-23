@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: backend
-  namespace: packamal
+  namespace: packamal-dev
 spec:
   replicas: 2
   selector:
@@ -44,7 +44,6 @@ spec:
                 echo "Waiting for database..."
                 sleep 1
               done
-              python manage.py migrate --noinput --skip-checks
               python manage.py collectstatic --noinput
       containers:
         - name: backend
@@ -108,7 +107,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: backend
-  namespace: packamal
+  namespace: packamal-dev
   annotations:
     cloud.google.com/neg: '{"ingress": true}'
     cloud.google.com/backend-config: '{"default": "packamal-backendconfig"}'

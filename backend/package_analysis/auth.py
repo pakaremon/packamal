@@ -3,8 +3,6 @@ Authentication utilities for API endpoints
 """
 from functools import wraps
 from django.http import JsonResponse
-from django.utils import timezone
-from django.core.cache import cache
 from django.conf import settings
 from .models import APIKey
 
@@ -41,46 +39,12 @@ def require_api_key(view_func):
                 'message': 'The provided API key is invalid or inactive'
             }, status=401)
         
-        # Check rate limiting
-        rate_limit_exceeded = check_rate_limit(api_key_obj)
-        if rate_limit_exceeded:
-            return JsonResponse({
-                'error': 'Rate limit exceeded',
-                'message': f'Maximum {api_key_obj.rate_limit_per_hour} requests per hour exceeded'
-            }, status=429)
-        
-        # Update last used timestamp
-        api_key_obj.last_used = timezone.now()
-        api_key_obj.save(update_fields=['last_used'])
-        
         # Add API key object to request for use in view
         request.api_key = api_key_obj
         
         return view_func(request, *args, **kwargs)
     
     return wrapper
-
-
-def check_rate_limit(api_key_obj: APIKey) -> bool:
-    """
-    Check if API key has exceeded rate limit
-    
-    Returns:
-        True if rate limit exceeded, False otherwise
-    """
-    cache_key = f"api_rate_limit_{api_key_obj.key}"
-    
-    # Get current request count from cache
-    current_count = cache.get(cache_key, 0)
-    
-    # Check if limit exceeded
-    if current_count >= api_key_obj.rate_limit_per_hour:
-        return True
-    
-    # Increment counter and set expiry to 1 hour
-    cache.set(cache_key, current_count + 1, 3600)
-    
-    return False
 
 
 def get_api_key_from_request(request):

@@ -25,13 +25,12 @@ from django.db.models import Q
 from django.utils import timezone
 
 from .helper import Helper
-from .models import AnalysisTask, ReportDynamicAnalysis
+from .models import AnalysisTask
 from .celery_redis_client import get_celery_redis_client
 from .view_constants import (
     STATUS_PROCESSING,
     STATUS_COMPLETED,
     STATUS_QUEUED,
-    STATUS_RECEIVED,
     STATUS_FAILED,
     STATUS_TIMEOUT,
     ERROR_CATEGORY_RESULTS_NOT_FOUND,
@@ -44,6 +43,8 @@ from .view_constants import (
     K8S_HTTP_NOT_FOUND,
     CELERY_QUEUE_ANALYSIS,
 )
+
+# Note: STATUS_RECEIVED removed from new model schema
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +98,12 @@ def _count_active_k8s_jobs() -> int | None:
 def _find_oldest_queued_task_for_trigger() -> AnalysisTask | None:
     """
     Find the oldest task eligible for triggering.
-    Eligible statuses: queued/received/pending (legacy).
+    Eligible status: queued only (STATUS_RECEIVED removed in new schema).
     Must not already have job_id set.
     """
     return (
         AnalysisTask.objects.filter(
-            status__in=[STATUS_QUEUED, STATUS_RECEIVED],
+            status=STATUS_QUEUED,
         )
         .filter(Q(job_id__isnull=True) | Q(job_id=''))
         .order_by('created_at', 'id')
@@ -124,14 +125,14 @@ def _reserve_task_for_processing(task_id: int) -> AnalysisTask | None:
         if not task:
             return None
 
-        if task.status not in [STATUS_QUEUED, STATUS_RECEIVED]:
+        if task.status != STATUS_QUEUED:
             return None
 
         if task.job_id:
             return None
 
         task.status = STATUS_PROCESSING
-        task.started_at = timezone.now()
+        # Note: started_at field removed in new schema
         task.save()
         return task
 
@@ -139,15 +140,8 @@ def _reserve_task_for_processing(task_id: int) -> AnalysisTask | None:
 def _mark_task_submission_failed(task: AnalysisTask, error: Exception) -> None:
     task.status = STATUS_FAILED
     task.completed_at = timezone.now()
-    task.error_message = str(error)
-    task.error_category = ERROR_CATEGORY_QUEUE_ERROR
-    details = task.error_details or {}
-    details['k8s_submission_error'] = {
-        'message': str(error),
-        'type': error.__class__.__name__,
-        'at': timezone.now().isoformat(),
-    }
-    task.error_details = details
+    task.error_message = f"K8s submission failed: {str(error)} ({error.__class__.__name__})"
+    # Note: error_category and error_details removed in new schema
     task.save()
 
 
@@ -183,12 +177,17 @@ def trigger_next_analysis_if_slot_available() -> dict:
 
         try:
             from .services.k8s_service import K8sService
+            from .utils import PURLParser
+            
+            # Extract package info from PURL since individual fields removed from model
+            package_name, package_version, ecosystem = PURLParser.extract_package_info(reserved.purl)
+            
             k8s_service = K8sService()
             job_name = k8s_service.run_analysis(
-                ecosystem=reserved.ecosystem,
-                package_name=reserved.package_name,
+                ecosystem=ecosystem,
+                package_name=package_name,
                 task_id=reserved.id,
-                package_version=reserved.package_version or "latest",
+                package_version=package_version or "latest",
             )
         except Exception as submission_error:
             _mark_task_submission_failed(reserved, submission_error)
@@ -224,8 +223,7 @@ def _reuse_existing_result(task, exclude_task_id=None):
     
     query = AnalysisTask.objects.filter(
         purl=task.purl,
-        status= STATUS_COMPLETED,
-        report__isnull=False
+        status= STATUS_COMPLETED
     )
     
     if exclude_task_id:
@@ -247,8 +245,7 @@ def _mark_task_completed_from_existing(task, existing_task):
     """
     task.status = STATUS_COMPLETED
     task.completed_at = timezone.now()
-    task.report = existing_task.report
-    task.download_url = existing_task.download_url
+    task.report_blob_url = existing_task.report_blob_url
     task.save()
 
 
@@ -392,29 +389,15 @@ def _check_and_prepare_task(task_id, celery_task):
                 'job_id': task.job_id,
             })
 
-        if task.status in [STATUS_RECEIVED, STATUS_QUEUED]:
-            task.status = STATUS_QUEUED
-            task.save()
+        if task.status == STATUS_QUEUED:
+            # Task already in correct state
+            pass
     
     return (task, None)
 
 
 
 
-
-
-def _extract_error_category(error):
-    """Extract error category from error object."""
-    if hasattr(error, 'error_details'):
-        return error.error_details.get('error_category', 'unknown_error')
-    return 'unknown_error'
-
-
-def _extract_error_details(error):
-    """Extract error details from error object."""
-    if hasattr(error, 'error_details'):
-        return error.error_details
-    return {}
 
 
 def _mark_task_failed(task_id, error):
@@ -425,8 +408,7 @@ def _mark_task_failed(task_id, error):
             task.status = STATUS_FAILED
             task.completed_at = timezone.now()
             task.error_message = str(error)
-            task.error_category = _extract_error_category(error)
-            task.error_details = _extract_error_details(error)
+            # Note: error_category and error_details removed in new schema
             task.save()
     except Exception as save_error:
         logger.error(f"Failed to save error state: {save_error}")
@@ -499,109 +481,130 @@ def _mark_task_as_timeout(task, job_name):
     """Mark task as timed out."""
     task.status = STATUS_TIMEOUT
     task.completed_at = timezone.now()
-    task.error_message = f"Job exceeded activeDeadlineSeconds ({task.timeout_minutes} minutes)"
-    task.error_category = ERROR_CATEGORY_TIMEOUT_ERROR
-    task.error_details = {
-        'reason': K8S_CONDITION_REASON_DEADLINE_EXCEEDED,
-        'job_name': job_name,
-        'timed_out_at': timezone.now().isoformat(),
-    }
+    task.error_message = f"Job {job_name} exceeded deadline (timeout)"
+    # Note: error_category, error_details, and timeout_minutes removed in new schema
     task.save()
 
 
-def _mark_task_as_completed(task):
+def _mark_task_as_completed(task, blob_url=None):
     """
     Mark task as completed.
 
-    NOTE: This should only be called after we have ensured results exist and have been
-    ingested into the database (ReportDynamicAnalysis + task.report). Otherwise we
-    can end up with "completed" tasks with missing reports when worker callbacks fail.
+    NOTE: In the new GCS-based architecture, this should only be called after the worker
+    callback has created the ReportDynamicAnalysis record with artifacts URLs.
     """
     task.status = STATUS_COMPLETED
     task.completed_at = timezone.now()
+    if blob_url:
+        task.report_blob_url = blob_url
     task.save()
 
 
-def _task_has_report(task: AnalysisTask) -> bool:
-    return bool(task.report_id)
 
-
-def _dynamic_result_key_for_task(task: AnalysisTask) -> str:
-    # Contract: task_id is always the deterministic key.
-    return str(task.id)
-
-
-def _load_dynamic_results(result_key: str):
-    from .services.result_storage_service import ResultStorageService
-
-    storage = ResultStorageService()
-    return storage.get_result_content(result_key)
-
-
-def _mark_task_failed_missing_results(task: AnalysisTask, result_key: str) -> None:
-    task.status = STATUS_FAILED
-    task.completed_at = timezone.now()
-    task.error_message = f"No results found for result_key={result_key}"
-    task.error_category = ERROR_CATEGORY_RESULTS_NOT_FOUND
-    details = task.error_details or {}
-    details["results_reconcile"] = {
-        "result_key": result_key,
-        "checked_at": timezone.now().isoformat(),
-    }
-    task.error_details = details
-    task.save()
-
-
-def _attach_report_from_dynamic_results(task: AnalysisTask, results) -> None:
-    from .report_generator import Report
-    from .services.report_service import ReportService
-    from .services.report_artifact_storage_service import ReportArtifactStorageService
-
-    report_data = Report.generate_report(results)
-    payload = {
-        "packages": {
-            "package_name": task.package_name,
-            "package_version": task.package_version,
-            "ecosystem": task.ecosystem,
-        },
-        "report": report_data,
-    }
-    artifact_storage = ReportArtifactStorageService()
-    report_location = artifact_storage.save_report(task.id, payload)
-    report_obj = ReportService.save_report_to_database(payload, report_location=report_location)
-    task.report = report_obj
-    task.save()
 
 
 def _reconcile_results_and_finalize_completion(task: AnalysisTask) -> None:
     """
-    Best-effort rescue path used by Celery beat when the Go worker callback didn't arrive.
+    Rescue path when worker callback didn't arrive.
+    Tries to recover results from GCS using deterministic paths.
+    """    
+    recovery_result = _attempt_gcs_recovery(task)
+    blob_url = recovery_result.blob_url
+    if recovery_result.succeeded:
+        complete_task_with_recovered_artifacts(task, blob_url)
+        return
+    
+    _mark_task_failed_no_artifacts(task)
 
-    Command-only: this function mutates task state (no return value).
+
+
+
+def _attempt_gcs_recovery(task: AnalysisTask):
+    """Attempts to recover artifacts from GCS."""
+    logger.info(f"Task {task.id} has no report, checking GCS for artifacts...")
+    
+    try:
+        return _try_recover_from_gcs(task)
+    except Exception as error:
+        return _handle_gcs_recovery_error(task, error)
+
+
+def _try_recover_from_gcs(task: AnalysisTask):
     """
-    if _task_has_report(task):
-        _mark_task_as_completed(task)
-        return
+    Tries to find and recover artifacts from GCS.
+    
+    Phase 1: Checks for {task_id}/report.json
+    Simple path avoids URL encoding issues.
+    """
+    gcs_service = _create_gcs_service()
+    
+    existing_artifacts = _find_artifacts_in_gcs(gcs_service, task.id)
+    
+    if existing_artifacts:
+        return _create_recovery_success(existing_artifacts, gcs_service, task.id)
+    
+    return _create_recovery_failure()
 
-    result_key = _dynamic_result_key_for_task(task)
-    results, result_location = _load_dynamic_results(result_key)
-    if not results:
-        # Store the last checked location (fs path or gs://...) to make debugging easier.
-        details = task.error_details or {}
-        details["results_reconcile"] = {
-            "result_key": result_key,
-            "checked_at": timezone.now().isoformat(),
-            "checked_location": result_location,
-        }
-        task.error_details = details
-        _mark_task_failed_missing_results(task, result_key)
-        return
 
-    task.result_location = result_location
+def _create_gcs_service():
+    """Creates GCS artifacts service."""
+    from .services.gcs_artifacts_service import GCSArtifactsService
+    return GCSArtifactsService()
+
+
+def _find_artifacts_in_gcs(gcs_service, task_id: int):
+    """
+    Checks GCS for existing artifacts at {task_id}/report.json
+    
+    Simple path structure avoids package name encoding issues.
+    """
+    return gcs_service.get_existing_artifacts(
+        task_id=task_id,
+        use_public_urls=True
+    )
+
+
+def _create_recovery_success(artifacts, gcs_service, task_id: int):
+    """Creates successful recovery result with simple {task_id}/ path."""
+    bucket_path = gcs_service.get_bucket_path(task_id)
+    logger.info(f"Task {task_id}: Found {len(artifacts)} artifacts in GCS at {bucket_path}")
+    return RecoveryResult(True, artifacts, bucket_path)
+
+
+def _create_recovery_failure():
+    """Creates failed recovery result."""
+    return RecoveryResult(False, None, None)
+
+
+def _handle_gcs_recovery_error(task: AnalysisTask, error: Exception):
+    """Handles errors during GCS recovery."""
+    logger.error(f"Task {task.id}: Error checking GCS: {error}", exc_info=True)
+    return _create_recovery_failure()
+
+
+
+def complete_task_with_recovered_artifacts(task: AnalysisTask, blob_url: str) -> None:
+    """Completes task using artifacts recovered from GCS."""
+    _mark_task_as_completed(task, blob_url)
+    logger.info(f"Task {task.id} recovered successfully from GCS")
+
+
+def _mark_task_failed_no_artifacts(task: AnalysisTask) -> None:
+    """Marks task as failed when no artifacts found in GCS."""
+    task.status = STATUS_FAILED
+    task.completed_at = timezone.now()
+    task.error_message = "Analysis failed - no artifacts found in GCS"
     task.save()
+    logger.warning(f"Task {task.id} marked as failed - no artifacts in GCS")
 
-    _attach_report_from_dynamic_results(task, results)
-    _mark_task_as_completed(task)
+
+# Data classes for clean data passing
+class RecoveryResult:
+    """Result of GCS recovery attempt."""
+    def __init__(self, succeeded: bool, artifacts: dict = None, bucket_path: str = None):
+        self.succeeded = succeeded
+        self.artifacts = artifacts
+        self.bucket_path = bucket_path
 
 
 def _get_pod_logs_for_job(k8s_service, job_name):
@@ -620,15 +623,15 @@ def _mark_task_as_failed(task, job_name, job_status, k8s_service):
     """Mark task as failed with error details."""
     task.status = STATUS_FAILED
     task.completed_at = timezone.now()
-    task.error_message = "K8s job failed"
-    task.error_category = ERROR_CATEGORY_K8S_JOB_FAILED
-    task.error_details = {
-        'job_name': job_name,
-        'failed_count': job_status.failed,
-    }
+    
+    # Try to get pod logs for better error visibility
     logs = _get_pod_logs_for_job(k8s_service, job_name)
     if logs:
-        task.error_details['pod_logs'] = logs
+        task.error_message = f"K8s job {job_name} failed (failed_count: {job_status.failed})\n\nPod logs:\n{logs[:1000]}"  # Truncate logs
+    else:
+        task.error_message = f"K8s job {job_name} failed (failed_count: {job_status.failed})"
+    
+    # Note: error_category and error_details removed in new schema
     task.save()
 
 
@@ -636,12 +639,8 @@ def _mark_task_as_job_not_found(task, job_name, api_error):
     """Mark task as failed due to job not found."""
     task.status = STATUS_FAILED
     task.completed_at = timezone.now()
-    task.error_message = f"K8s job {job_name} not found"
-    task.error_category = ERROR_CATEGORY_K8S_JOB_NOT_FOUND
-    task.error_details = {
-        'job_name': job_name,
-        'error': str(api_error),
-    }
+    task.error_message = f"K8s job {job_name} not found: {str(api_error)}"
+    # Note: error_category and error_details removed in new schema
     task.save()
 
 
@@ -859,19 +858,23 @@ def check_and_trigger_next_analysis():
 
 
 def _save_pod_logs_to_task(task, k8s_service, job_name):
-    """Save pod logs to task error_details if not already present."""
-    if 'pod_logs' in task.error_details:
-        return
+    """
+    Save pod logs to task error_message if not already present.
+    Note: error_details field removed in new schema, so we append to error_message.
+    """
+    if task.error_message and 'Pod logs:' in task.error_message:
+        return  # Logs already saved
     
     try:
         pods = k8s_service.list_pods_for_job(job_name)
         if pods.items:
             pod = pods.items[0]
             logs = k8s_service.get_pod_logs(pod.metadata.name, tail_lines=500)
-            if not task.error_details:
-                task.error_details = {}
-            task.error_details['pod_logs'] = logs
-            task.save()
+            # Append logs to error_message (truncate if too long)
+            if logs:
+                current_msg = task.error_message or ""
+                task.error_message = f"{current_msg}\n\nPod logs:\n{logs[:2000]}"  # Keep first 2000 chars
+                task.save()
     except Exception as log_error:
         logger.warning(f"Could not retrieve logs for job {job_name} before cleanup: {log_error}")
 

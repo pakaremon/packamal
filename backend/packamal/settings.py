@@ -226,20 +226,19 @@ YARA_RULES_REPO_URL = os.environ.get(
     'https://github.com/pakaremon/rust-mal/tree/master/web/package-analysis-web/package_analysis/src/yara/rules'
 )
 
-# Redis configuration for caching (report storage and Django cache)
-# Default to 'redis://redis:6379/0' for docker-compose compatibility (single Redis instance)
-# In K8s/AKS, set REDIS_CACHE_URL to 'redis://redis-report:6379/0' (separate Redis for caching)
-REDIS_CACHE_URL = os.environ.get('REDIS_CACHE_URL', 'redis://redis:6379/0')
+
 PROFESSIONAL_REPORT_TTL_SECONDS = int(
     os.environ.get('PROFESSIONAL_REPORT_TTL_SECONDS', 24 * 60 * 60)
 )
+
+REDIS_URL = os.environ.get('REDIS_URL', 'redis://redis-celery:6379/0')
 
 # Django cache configuration - use Redis to avoid consuming backend RAM
 # Separate Redis instance from Celery (redis-celery) to isolate cache from task queue
 CACHES = {
     'default': {
         'BACKEND': 'django.core.cache.backends.redis.RedisCache',
-        'LOCATION': REDIS_CACHE_URL,
+        'LOCATION': REDIS_URL,
         'KEY_PREFIX': 'django_cache',
         'TIMEOUT': None,  # Keys don't expire by default
     }

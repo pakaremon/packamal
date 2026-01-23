@@ -11,8 +11,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         name = options['name']
-        rate = options['rate']
-        api_key = APIKey.objects.create(name=name, rate_limit_per_hour=rate)
+        api_key = APIKey.objects.create(name=name)
         self.stdout.write(self.style.SUCCESS(f"Created API key: {api_key.key}"))
 
 

@@ -2,7 +2,8 @@
 
 set -e
 
-
+# Set namespace
+NAMESPACE="${NAMESPACE:-packamal}"
 
 # Get database pod name
 DB_POD_NAME=$(kubectl get pods -n "$NAMESPACE" -l app=database -o jsonpath='{.items[0].metadata.name}')

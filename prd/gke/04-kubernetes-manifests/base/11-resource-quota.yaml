@@ -6,11 +6,11 @@ spec:
   hard:
     # Tuned for a small app node pool (e2-standard-4 class).
     # Keep requests under node allocatable (CPU ~3920m, Mem ~13Gi) to avoid Pending pods.
-    requests.cpu: "3600m"
-    requests.memory: "12Gi"
+    requests.cpu: "10"
+    requests.memory: "40Gi"
     # Limits can be higher to allow burst/overcommit, but keep reasonable for stability.
-    limits.cpu: "8"
-    limits.memory: "16Gi"
+    limits.cpu: "16"
+    limits.memory: "64Gi"
 ---
 apiVersion: v1
 kind: LimitRange

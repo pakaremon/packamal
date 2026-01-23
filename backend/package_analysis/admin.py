@@ -1,104 +1,98 @@
 from django.contrib import admin
-from .models import Package, ReportDynamicAnalysis, APIKey, AnalysisTask
-# Register your models here.
+from django.utils.html import format_html
+from django.template.defaultfilters import truncatechars
+from .models import Package, APIKey, AnalysisTask
 
-class PackageAdmin(admin.ModelAdmin):
-    list_display = ('package_name', 'package_version', 'ecosystem')
-
-# class ReportDynamicAnalysisAdmin(admin.ModelAdmin):
-#     list_display = ('package', 'report')
-
+# ==========================================
+# 1. API KEY ADMIN
+# ==========================================
+@admin.register(APIKey)
 class APIKeyAdmin(admin.ModelAdmin):
-    list_display = ('name', 'key', 'is_active', 'rate_limit_per_hour', 'created_at', 'last_used')
-    list_filter = ('is_active', 'created_at')
-    search_fields = ('name', 'key')
-    readonly_fields = ('key', 'created_at', 'last_used')
-
-class AnalysisTaskAdmin(admin.ModelAdmin):
-    list_display = ('id', 'purl', 'status', 'ecosystem', 'package_name', 'package_version', 'api_key', 'created_at', 'completed_at', 'has_report')
-    list_filter = ('status', 'ecosystem', 'created_at', 'completed_at')
-    search_fields = ('purl', 'package_name', 'package_version', 'api_key__name', 'job_id')
-    readonly_fields = ('id', 'created_at', 'started_at', 'completed_at', 'error_details_preview')
-    exclude = ('error_details',)  # Exclude large JSONField from direct display
-    list_per_page = 50  # Limit items per page to improve performance
-    ordering = ('-created_at',)  # Order by most recent first
+    list_display = ('name', 'key_masked', 'is_active', 'created_at')
+    list_filter = ('is_active',)
+    search_fields = ('name',)
     
+    def get_readonly_fields(self, request, obj=None):
+        return ['key', 'created_at'] if obj else []
+
+    def key_masked(self, obj):
+        return f"{obj.key[:8]}..." if obj.key else "-"
+    key_masked.short_description = "API Key Prefix"
+
+# ==========================================
+# 2. PACKAGE ADMIN
+# ==========================================
+@admin.register(Package)
+class PackageAdmin(admin.ModelAdmin):
+    list_display = ('id', 'ecosystem', 'package_name', 'package_version')
+    list_filter = ('ecosystem',)
+    search_fields = ('package_name', 'package_version')
+
+# ==========================================
+# 3. ANALYSIS TASK ADMIN (Tối giản nhất)
+# ==========================================
+@admin.register(AnalysisTask)
+class AnalysisTaskAdmin(admin.ModelAdmin):
+    # Chỉ giữ lại các cột thực sự quan trọng ở trang danh sách
+    list_display = ('id', 'purl_preview', 'status_badge', 'download_report', 'duration', 'created_at')
+    list_filter = ('status', 'created_at')
+    search_fields = ('purl', 'job_id', 'error_message')
+    
+    readonly_fields = ('created_at', 'completed_at', 'job_id', 'error_log_viewer')
+
     fieldsets = (
-        ('Basic Information', {
-            'fields': ('id', 'purl', 'package_name', 'package_version', 'ecosystem', 'status', 'api_key')
+        ('Basic Info', {
+            'fields': ('api_key', 'purl', 'status')
         }),
-        ('Timing', {
-            'fields': ('created_at', 'started_at', 'completed_at', 'timeout_minutes', 'last_heartbeat')
+        ('Result', {
+            'fields': ('report_blob_url',)
         }),
-        ('Job Management', {
-            'fields': ('priority', 'job_id', 'container_id')
-        }),
-        ('Results', {
-            # Removed 'report' field to prevent loading huge 37MB+ JSONField (system_calls array)
-            # The report relationship exists but is not displayed to avoid memory issues
-            # Use has_report column in list view or download_url to access report data
-            'fields': ('download_url',)
-        }),
-        ('Error Information', {
-            'fields': ('error_message', 'error_category', 'error_details_preview'),
-            'classes': ('collapse',)
+        ('K8s Debugging', {
+            'fields': ('job_id', 'created_at', 'completed_at', 'error_log_viewer'),
+            'classes': ('collapse',) # Thu gọn phần này lại cho đỡ rối
         }),
     )
-    
-    def get_queryset(self, request):
-        """Optimize queryset with select_related and defer large fields to prevent timeout."""
-        qs = super().get_queryset(request)
-        # Always select_related on lightweight api_key
-        qs = qs.select_related('api_key')
-        
-        # Always defer error_details to prevent loading huge JSONField into memory
-        # It will be loaded on-demand when error_details_preview accesses it
-        # This prevents loading the entire JSONField for all objects in list view
-        qs = qs.defer('error_details')
-        
-        # Note: We intentionally avoid select_related('report', 'report__package') 
-        # because report.report is a huge JSONField that can cause memory issues.
-        # The OneToOneField relationship will load the report lazily when accessed,
-        # which is acceptable for individual change views but avoids eager loading
-        # the huge JSONField for all tasks in list views.
-        return qs
-    
-    def error_details_preview(self, obj):
-        """Show a preview of error_details instead of full JSON to prevent timeout."""
-        # Check if error_details exists without loading it if deferred
-        # Accessing obj.error_details will trigger DB query if deferred, but only once
-        try:
-            # Use hasattr to check if attribute exists without triggering query
-            # But Django's deferred fields still need to be accessed
-            error_details = obj.error_details if hasattr(obj, 'error_details') else None
-            if not error_details:
-                return "No error details"
-            
-            import json
-            error_str = json.dumps(error_details, indent=2)
-            # Limit to first 1000 characters to prevent rendering huge JSON fields
-            # This limits display, but the full JSON is still loaded into memory temporarily
-            # To truly optimize, we'd need to use database-level substring, but this helps
-            if len(error_str) > 1000:
-                return f"{error_str[:1000]}...\n\n[Truncated - Full error details available in database]"
-            return error_str
-        except (TypeError, ValueError) as e:
-            return f"Error displaying details: {str(e)}"
-        except Exception as e:
-            # Handle case where field might be deferred and causes issues
-            return f"Error loading details: {str(e)}"
-    
-    error_details_preview.short_description = 'Error Details (Preview)'
-    
-    def has_report(self, obj):
-        """Display whether task has a report without loading the huge JSONField."""
-        # Returns boolean so Django admin can render checkmark/cross icons
-        return bool(obj.report_id)
-    has_report.short_description = 'Has Report'
-    has_report.boolean = True
 
-admin.site.register(Package, PackageAdmin)
-# admin.site.register(ReportDynamicAnalysis, ReportDynamicAnalysisAdmin)
-admin.site.register(APIKey, APIKeyAdmin)
-admin.site.register(AnalysisTask, AnalysisTaskAdmin)
+    def purl_preview(self, obj):
+        return truncatechars(obj.purl, 40)
+    purl_preview.short_description = "PURL"
 
+    # Hiển thị nút tải file trực tiếp nếu có URL
+    def download_report(self, obj):
+        if obj.report_blob_url:
+            return format_html(
+                '<a href="{}" target="_blank" style="background: #2563eb; color: white; padding: 4px 10px; border-radius: 4px; text-decoration: none; font-weight: bold; font-size: 10px;">⬇ DOWNLOAD</a>',
+                obj.report_blob_url
+            )
+        return format_html('<span style="color: #9ca3af;">No Report</span>')
+    download_report.short_description = "Report"
+
+    def status_badge(self, obj):
+        colors = {
+            'completed': ('#dcfce7', '#166534'), # Green
+            'failed': ('#fee2e2', '#991b1b'),    # Red
+            'processing': ('#dbeafe', '#1e40af'), # Blue
+            'queued': ('#fef9c3', '#854d0e'),     # Yellow
+            'timeout': ('#f3e8ff', '#6b21a8'),    # Purple
+        }
+        bg, text = colors.get(obj.status, ('#f3f4f6', '#374151'))
+        return format_html(
+            '<span style="background: {}; color: {}; padding: 4px 12px; border-radius: 20px; font-weight: bold; font-size: 10px;">{}</span>',
+            bg, text, obj.get_status_display().upper()
+        )
+    status_badge.short_description = "Status"
+
+    def duration(self, obj):
+        if obj.completed_at and obj.created_at:
+            diff = obj.completed_at - obj.created_at
+            return f"{int(diff.total_seconds())}s"
+        return "-"
+
+    def error_log_viewer(self, obj):
+        if not obj.error_message:
+            return "No errors."
+        return format_html(
+            '<pre style="background: #1a1a1a; color: #f87171; padding: 10px; border-radius: 4px; font-size: 11px; max-height: 200px; overflow: auto;">{}</pre>',
+            obj.error_message
+        )
+    error_log_viewer.short_description = "Error Log"

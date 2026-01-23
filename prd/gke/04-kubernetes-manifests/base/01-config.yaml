@@ -3,7 +3,7 @@ kind: ConfigMap
 metadata:
   name: packamal-config
 data:
-  DEBUG: "False"
+  DEBUG: "True"
   EXECUTION_MODE: "k8s"
   ALLOWED_HOSTS: "*"
   CSRF_TRUSTED_ORIGINS: "https://packguard.dev"
@@ -19,8 +19,11 @@ data:
   GCS_MEDIA_LOCATION: "media"
 
   # Dynamic analysis raw results (Go worker writes here; backend reads here)
+  # IMPORTANT: Must match GCS_ANALYSIS_BUCKET and GCS_ANALYSIS_BUCKET_PREFIX for backend to read worker uploads
   RESULTS_BUCKET_URL: "gs://packamal-${PROJECT_ID}/dynamic-results/"
   ANALYSIS_DYNAMIC_BUCKET_URL: "gs://packamal-${PROJECT_ID}/dynamic-results/"
+  GCS_ANALYSIS_BUCKET: "packamal-${PROJECT_ID}"
+  GCS_ANALYSIS_BUCKET_PREFIX: "dynamic-results"
 
   # Optional: store generated report payloads (JSON) as artifacts too
   REPORT_ARTIFACTS_BUCKET_URL: "gs://packamal-${PROJECT_ID}/report-artifacts/"
@@ -32,7 +35,7 @@ data:
 
   CELERY_BROKER_URL: "redis://redis-celery:6379/0"
   CELERY_RESULT_BACKEND: "redis://redis-celery:6379/0"
-  REDIS_CACHE_URL: "redis://redis-report:6379/0"
+  REDIS_URL: "redis://redis-celery:6379/0"
 
   INTERNAL_API_BASE_URL: "http://backend:8000/api/v1/internal/callback"
   ANALYSIS_TIMEOUT: "30m"

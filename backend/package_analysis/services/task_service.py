@@ -32,7 +32,6 @@ class TaskService:
         return AnalysisTask.objects.filter(
             purl=purl,
             status=STATUS_COMPLETED,
-            report__isnull=False
         ).order_by('-completed_at').first()
 
     @staticmethod

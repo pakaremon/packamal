@@ -1,0 +1,79 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: django-force-reset-db
+  namespace: ${NAMESPACE}
+  labels:
+    app: backend
+    component: database-reset
+spec:
+  ttlSecondsAfterFinished: 300  # Tự động xóa Job sau 5 phút kể từ khi chạy xong
+  backoffLimit: 3 # Cho phép thử lại 3 lần nếu lỗi
+  template:
+    metadata:
+      labels:
+        app: backend
+        component: database-reset
+    spec:
+      restartPolicy: Never
+      serviceAccountName: backend-serviceaccount
+      initContainers:
+      # Chờ Database sẵn sàng trước khi chạy
+      - name: wait-for-database
+        image: postgres:16-alpine
+        command:
+          - sh
+          - -c
+          - |
+            echo "Waiting for PostgreSQL..."
+            until pg_isready -h database -p 5432; do
+              echo "Database not ready, waiting..."
+              sleep 2
+            done
+            echo "✅ Database is ready!"
+      containers:
+      - name: reset-and-migrate
+        image: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/backend:${TAG}
+        imagePullPolicy: Always # Đảm bảo luôn lấy image mới nhất
+        command:
+          - /bin/bash
+          - -c
+          - |
+            echo "=========================================="
+            echo "⚠️  WARNING: FORCING BRAND NEW DATABASE STATE"
+            echo "=========================================="
+            
+            # Bước 1: Xóa trắng toàn bộ schema public
+            echo "🗑️  Dropping all existing tables, indexes, and migrations..."
+            python manage.py dbshell <<EOF
+            DROP SCHEMA public CASCADE;
+            CREATE SCHEMA public;
+            GRANT ALL ON SCHEMA public TO public;
+            \q
+            EOF
+            
+            echo "✨ Schema recreated successfully."
+            echo ""
+            
+            # Bước 2: Chạy lại migration từ đầu
+            echo "🔄 Running fresh migrations..."
+            python manage.py migrate --noinput
+            echo ""
+            
+            # Bước 3: Kiểm tra kết quả
+            echo "✅ Database Reset & Migrations completed successfully!"
+            echo "📋 Applied migrations:"
+            python manage.py showmigrations
+            echo "=========================================="
+        envFrom:
+          - configMapRef:
+              name: packamal-config
+          - secretRef:
+              name: packamal-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"

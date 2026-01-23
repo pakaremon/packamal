@@ -44,7 +44,6 @@ spec:
                 echo "Waiting for database..."
                 sleep 1
               done
-              python manage.py migrate --noinput --skip-checks
               python manage.py collectstatic --noinput
       containers:
         - name: backend

@@ -24,7 +24,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: backend-serviceaccount
-    namespace: packamal
+    namespace: packamal-dev
 roleRef:
   kind: Role
   name: backend-job-creator

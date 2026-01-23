@@ -1,0 +1,76 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: django-migrate
+  namespace: packamal-dev
+  labels:
+    app: backend
+    component: migration
+spec:
+  ttlSecondsAfterFinished: 300  # Auto-cleanup after 5 minutes
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: backend
+        component: migration
+    spec:
+      restartPolicy: Never
+      serviceAccountName: backend-serviceaccount
+      initContainers:
+      # Wait for database to be ready
+      - name: wait-for-database
+        image: postgres:16-alpine
+        command:
+          - sh
+          - -c
+          - |
+            echo "Waiting for PostgreSQL..."
+            until pg_isready -h database -p 5432; do
+              echo "Database not ready, waiting..."
+              sleep 2
+            done
+            echo "✅ Database is ready!"
+      containers:
+      - name: migrate
+        image: us-central1-docker.pkg.dev/k8s-packamal/packamal-repo/backend:v1
+        command:
+          - /bin/bash
+          - -c
+          - |
+            echo "=========================================="
+            echo "🔄 Running Django Migrations"
+            echo "=========================================="
+            
+            # Drop old tables to enforce fresh migration
+            echo "🗑️  Dropping old tables..."
+            python manage.py dbshell <<EOF
+            DROP TABLE IF EXISTS package_analysis_analysistask CASCADE;
+            DROP TABLE IF EXISTS package_analysis_reportdynamicanalysis CASCADE;
+            DROP TABLE IF EXISTS package_analysis_package CASCADE;
+            DROP TABLE IF EXISTS package_analysis_apikey CASCADE;
+            DELETE FROM django_migrations WHERE app = 'package_analysis';
+            \q
+            EOF
+            
+            echo ""
+            echo "🔄 Running migrations..."
+            python manage.py migrate --noinput
+            echo ""
+            echo "✅ Migrations completed successfully!"
+            echo ""
+            echo "📋 Applied migrations:"
+            python manage.py showmigrations
+            echo "=========================================="
+        envFrom:
+          - configMapRef:
+              name: packamal-config
+          - secretRef:
+              name: packamal-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"

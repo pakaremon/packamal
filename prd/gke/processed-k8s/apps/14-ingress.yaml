@@ -3,7 +3,7 @@
 # kind: ManagedCertificate
 # metadata:
 #   name: packamal-managed-cert
-#   namespace: packamal
+#   namespace: packamal-dev
 # spec:
 #   domains:
 #     - packguard.dev
@@ -12,7 +12,7 @@
 # kind: FrontendConfig
 # metadata:
 #   name: packamal-frontend-config
-#   namespace: packamal
+#   namespace: packamal-dev
 # spec:
 #   redirectToHttps:
 #     enabled: true
@@ -21,7 +21,7 @@ apiVersion: cloud.google.com/v1
 kind: BackendConfig
 metadata:
   name: packamal-backendconfig
-  namespace: packamal
+  namespace: packamal-dev
 spec:
   timeoutSec: 600
   healthCheck:
@@ -36,7 +36,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: packamal-ingress
-  namespace: packamal
+  namespace: packamal-dev
   annotations:
     kubernetes.io/ingress.class: gce
     # kubernetes.io/ingress.global-static-ip-name: 
